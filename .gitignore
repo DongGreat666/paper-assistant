@@ -1,0 +1,82 @@
+*.db
+.states
+.claude/
+.workbuddy/
+.chrome-cdp-profile/
+assets/external/
+.web
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+frontend.zip
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables (contains secrets!)
+.env
+
+# Data directories (runtime-generated)
+data/vector_db/
+data/chat_history/
+data/cache/
+data/settings.json
+data/translation_engines.json
+data/secrets.json
+
+# User papers (user's files, don't commit)
+papers/*.pdf
+papers/*.PDF
+papers/*.docx
+papers/*.DOCX
+!papers/.gitkeep
+
+# Reflex specific
+.reflex/
+
+# Local runtime logs and scratch artifacts
+reflex_output.log
+reflex_backend.log
+reflex-run-*.log
+parse_*.txt
+test_parse*.py
+-w
+logs/
+artifacts/
+downloads/
+scripts/experiments/
+scripts/*.png
+scripts/*.ris
+
+# User-uploaded runtime files
+uploaded_files/
+
+# Local ML model cache
+models/
+
+# Local frontend dependency cache
+pdf-reader/node_modules/
+
+# Local model/API engine config may contain secrets
+data/chat_engines.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
