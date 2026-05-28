@@ -1,5 +1,6 @@
 """Paper library and reading workspace page."""
 
+import asyncio
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from src.core.engine import (
     api_key_display,
     build_engine,
     build_engine_from_profile,
+    delete_api_secret_refs,
     get_default_translation_engine,
     load_chat_engine_profiles,
     load_engine_profiles,
@@ -26,6 +28,7 @@ from src.core.engine import (
 )
 from src.core.translator import translate_inline, translate_section
 from src.core.chat_engine import extract_nearby_text, extract_full_text, build_chat_messages, chat_with_context
+from config import read_settings
 
 UPLOAD_DIR = Path("uploaded_files")
 
@@ -66,6 +69,9 @@ EVENT_BUS_JS = """
   if (!window.__pdfBridgeMessageListenerInstalled) {
     window.__pdfBridgeMessageListenerInstalled = true;
     window.addEventListener('message', function(e) {
+      if (e.origin !== window.location.origin) return;
+      var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+      if (iframe && e.source !== iframe.contentWindow) return;
       if (e.data && e.data.source === 'pdf-reader') {
         window.__pdfBridge.emit(e.data);
       }
@@ -155,6 +161,7 @@ class LibraryState(rx.State):
     chat_engine_api_key: str = ""
     chat_engine_base_url: str = ""
     chat_engine_model: str = ""
+    chat_engine_temperature: str = "0.3"
 
     # Profile editing state
     editing_profile_id: str = ""
@@ -250,16 +257,14 @@ class LibraryState(rx.State):
 
     def _safe_folder_path(self, folder: str) -> Path | None:
         folder = self._safe_name(folder)
-        root = UPLOAD_DIR.resolve()
         target = (UPLOAD_DIR / folder).resolve()
-        if not str(target).startswith(str(root)):
+        if not target.is_relative_to(UPLOAD_DIR.resolve()):
             return None
         return target
 
     def _safe_pdf_path(self, path: str) -> Path | None:
-        root = UPLOAD_DIR.resolve()
         target = (UPLOAD_DIR / path).resolve()
-        if not str(target).startswith(str(root)) or target.suffix.lower() != ".pdf":
+        if not target.is_relative_to(UPLOAD_DIR.resolve()) or target.suffix.lower() != ".pdf":
             return None
         return target
 
@@ -498,12 +503,17 @@ class LibraryState(rx.State):
         safe_file = quote(path.split("/", 1)[1] if "/" in path else path)
         self.pdf_reader_url = f"/pdf-reader/index.html?file=/api/pdf/{safe_folder}/{safe_file}"
         # path is like "folder/filename.pdf" or just "filename.pdf"
-        self.selected_pdf_path = str(UPLOAD_DIR / path)
+        self.selected_pdf_path = path
         self.left_open = False
         self.selected_text = ""
         self.translation_result = ""
         self.translation_rects = ""
         self.translation_page = 0
+        # Respect reading preference: auto-open chat panel
+        prefs = read_settings()
+        if prefs.get("pref_show_chat_on_open", True):
+            self.right_open = True
+            self.right_tab = "chat"
         # Load existing highlights from PDF and send to iframe after it loads
         return self._load_and_send_highlights()
 
@@ -527,13 +537,34 @@ class LibraryState(rx.State):
         return get_default_translation_engine()
 
     def _build_chat_engine(self) -> TranslationEngine:
-        """Build chat engine from model tab config only."""
+        """Build the selected chat engine, resolving its latest key reference."""
+        for profile in load_chat_engine_profiles():
+            if profile.get("id") == self.current_chat_engine_id:
+                return build_engine_from_profile(profile, default_profile="qa")
         return build_engine(
             api_key=self.chat_engine_api_key,
             base_url=self.chat_engine_base_url,
             model=self.chat_engine_model,
-            temperature=0.3,
+            temperature=self.chat_engine_temperature,
+            default_profile="qa",
         )
+
+    def _chat_engine_supports_vision(self, engine: TranslationEngine) -> bool:
+        """Return whether the selected chat engine is likely to accept image_url parts."""
+        model = (engine.model or "").lower()
+        base_url = (engine.base_url or "").lower()
+        vision_markers = (
+            "moonshot",
+            "kimi",
+            "gpt-4o",
+            "gpt-4.1",
+            "vision",
+            "vl",
+            "glm-4v",
+            "gemini",
+            "claude-3",
+        )
+        return any(marker in model or marker in base_url for marker in vision_markers)
 
     def _get_note_path(self) -> Path | None:
         """Get the note.md path in the same folder as the PDF."""
@@ -543,6 +574,8 @@ class LibraryState(rx.State):
 
     def _remove_note_entry(self, kind: str, text: str):
         """Remove a matching entry from note.md."""
+        if not read_settings().get("pref_save_notes_to_paper_dir", True):
+            return
         note_path = self._get_note_path()
         if not note_path or not note_path.exists():
             return
@@ -573,6 +606,8 @@ class LibraryState(rx.State):
 
     def _append_note(self, kind: str, text: str, note: str = ""):
         """Append an entry to note.md in the PDF's folder."""
+        if not read_settings().get("pref_save_notes_to_paper_dir", True):
+            return
         note_path = self._get_note_path()
         if not note_path:
             return
@@ -597,14 +632,15 @@ class LibraryState(rx.State):
         """Read highlights from PDF and send to iframe without reloading it."""
         if not self.selected_pdf_path:
             return
+        safe_path = self.selected_pdf_path.replace("\\", "/")
         return rx.call_script(
             f"""setTimeout(function() {{
-              fetch('/api/pdf-highlights?path=' + encodeURIComponent('{self.selected_pdf_path.replace(chr(92), "/")}'))
+              fetch('/api/pdf-highlights?path=' + encodeURIComponent({json.dumps(safe_path)}))
                 .then(r => r.json())
                 .then(data => {{
                   var iframe = document.querySelector('iframe[src*="pdf-reader"]');
                   if (iframe && iframe.contentWindow) {{
-                    iframe.contentWindow.postMessage({{type: 'LOAD_HIGHLIGHTS', highlights: data}}, '*');
+                    iframe.contentWindow.postMessage({{type: 'LOAD_HIGHLIGHTS', highlights: data}}, window.location.origin);
                   }}
                 }})
                 .catch(() => {{}});
@@ -699,6 +735,7 @@ class LibraryState(rx.State):
                 self.chat_engine_api_key = api_key_display(p)
                 self.chat_engine_base_url = p.get("base_url", "")
                 self.chat_engine_model = p.get("model", "")
+                self.chat_engine_temperature = p.get("temperature", "0.3")
                 break
 
     def select_chat_engine(self, profile_id: str):
@@ -731,13 +768,15 @@ class LibraryState(rx.State):
         eid = self.editing_chat_profile_id
         if eid == "new":
             eid = f"chat-{len(self.chat_engine_profiles)}"
+        model = self.edit_model.strip()
+        temperature = "1" if model.startswith("kimi-k2.") else "0.3"
         profile = {
             "id": eid,
             "name": self.edit_name.strip(),
             "api_key": self.edit_api_key.strip(),
             "base_url": self.edit_base_url.strip(),
-            "model": self.edit_model.strip(),
-            "temperature": "0.3",
+            "model": model,
+            "temperature": temperature,
         }
         updated = False
         new_list = []
@@ -758,6 +797,12 @@ class LibraryState(rx.State):
             self._apply_chat_engine()
 
     def delete_chat_profile(self, profile_id: str):
+        removed = [p for p in self.chat_engine_profiles if p.get("id") == profile_id]
+        delete_api_secret_refs([
+            ref
+            for p in removed
+            for ref in [p.get("api_key_ref", ""), f"chat:{profile_id}"]
+        ])
         new_list = [p for p in self.chat_engine_profiles if p.get("id") != profile_id]
         self.chat_engine_profiles = new_list
         save_chat_engine_profiles(new_list)
@@ -812,6 +857,12 @@ class LibraryState(rx.State):
 
     def delete_profile(self, profile_id: str):
         """Delete a profile by ID."""
+        removed = [p for p in self.engine_profiles if p.get("id") == profile_id]
+        delete_api_secret_refs([
+            ref
+            for p in removed
+            for ref in [p.get("api_key_ref", ""), f"engine:{profile_id}"]
+        ])
         new_list = [p for p in self.engine_profiles if p.get("id") != profile_id]
         self.engine_profiles = new_list
         save_engine_profiles(new_list)
@@ -847,20 +898,21 @@ class LibraryState(rx.State):
                 """(function() {
                   var iframe = document.querySelector('iframe[src*="pdf-reader"]');
                   if (iframe && iframe.contentWindow) {
-                    iframe.contentWindow.postMessage({type: 'AUTO_TRANSLATE', enabled: false}, '*');
+                    iframe.contentWindow.postMessage({type: 'AUTO_TRANSLATE', enabled: false}, window.location.origin);
                   }
                 })()"""
             )
         else:
             self.right_tab = tab
             self.right_open = True
-            # Enable auto-translate when translate tab is active
-            enabled = "true" if tab == "translate" else "false"
+            # Enable auto-translate when translate tab is active and preference is on
+            auto_ok = read_settings().get("pref_auto_translate", True)
+            enabled = "true" if tab == "translate" and auto_ok else "false"
             return rx.call_script(
                 f"""(function() {{
                   var iframe = document.querySelector('iframe[src*="pdf-reader"]');
                   if (iframe && iframe.contentWindow) {{
-                    iframe.contentWindow.postMessage({{type: 'AUTO_TRANSLATE', enabled: {enabled}}}, '*');
+                    iframe.contentWindow.postMessage({{type: 'AUTO_TRANSLATE', enabled: {enabled}}}, window.location.origin);
                   }}
                 }})()"""
             )
@@ -906,13 +958,15 @@ class LibraryState(rx.State):
             page_num = self.selected_page
             nearby = ""
             full_text = ""
+            loop = asyncio.get_event_loop()
             if self.selected_pdf_path:
-                if self.chat_scope == "paper":
-                    full_text = extract_full_text(self.selected_pdf_path)
-                else:
-                    # selection scope (default)
-                    nearby = extract_nearby_text(
-                        self.selected_pdf_path, page_num, sel_text
+                full_text = await loop.run_in_executor(
+                    None, extract_full_text, self.selected_pdf_path
+                )
+                if sel_text:
+                    nearby = await loop.run_in_executor(
+                        None, extract_nearby_text,
+                        self.selected_pdf_path, page_num, sel_text,
                     )
 
             engine = self._build_chat_engine()
@@ -946,6 +1000,92 @@ class LibraryState(rx.State):
         yield
         async for _ in self.send_chat():
             pass
+
+    async def handle_explain_request(
+        self,
+        id: str,
+        text: str = "",
+        image: str = "",
+        rects: str = "",
+        page: int = 0,
+    ):
+        """Explain selected text or an area selection in a floating PDF popup."""
+        if not id:
+            return
+
+        selected = (text or "").strip()
+        image_data = (image or "").strip()
+        self.selected_text = selected
+        self.translation_rects = rects
+        self.translation_page = page
+
+        try:
+            engine = self._build_chat_engine()
+            if image_data:
+                if not self._chat_engine_supports_vision(engine):
+                    result = (
+                        f"当前问答引擎「{engine.model}」看起来不支持图片/公式截图解释。"
+                        "请切换到 Kimi、GPT-4o、Qwen-VL、GLM-4V 等视觉模型，"
+                        "或直接选中文字后再点解释。"
+                    )
+                    return rx.call_script(
+                        f"""(function() {{
+                          var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+                          if (iframe && iframe.contentWindow) {{
+                            iframe.contentWindow.postMessage({{type: 'EXPLAIN_RESULT', id: {json.dumps(id)}, explanation: {json.dumps(result)}}}, window.location.origin);
+                          }}
+                        }})()"""
+                    )
+                system = (
+                    "你是学术论文阅读助手。请解释用户框选的论文图片、公式或表格区域。"
+                    "回答要聚焦框选区域，不要泛泛总结整篇论文。"
+                    "请用中文简洁回答，控制在 5 条以内。"
+                )
+                prompt = (
+                    "请简洁解释这块框选区域。"
+                    "如果是公式，请说明符号含义和推导直觉；"
+                    "如果是图表，请说明变量、趋势和作者想表达的结论；"
+                    "如果是表格，请说明主要比较项和关键结论。"
+                    "不要输出长篇背景介绍，不要使用 Markdown 标题。"
+                )
+                messages: list[dict] = [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_data}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    },
+                ]
+            else:
+                system = (
+                    "你是学术论文阅读助手。请解释用户选中的论文文字。"
+                    "只围绕这段选中文本解释，不要翻译全文，不要扩展到整篇论文。"
+                    "请用中文简洁回答，控制在 3 到 5 条以内。"
+                )
+                prompt = (
+                    "请简洁解释下面这段论文内容：核心意思是什么、关键术语是什么意思。"
+                    "不要使用 Markdown 标题，不要写长篇背景。\n\n"
+                    f"{selected}"
+                )
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ]
+
+            result = await chat_with_context(messages, engine, max_tokens=700 if image_data else 450)
+        except Exception as exc:
+            result = f"解释失败：{exc}"
+
+        return rx.call_script(
+            f"""(function() {{
+              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+              if (iframe && iframe.contentWindow) {{
+                iframe.contentWindow.postMessage({{type: 'EXPLAIN_RESULT', id: {json.dumps(id)}, explanation: {json.dumps(result)}}}, window.location.origin);
+              }}
+            }})()"""
+        )
 
     # --- Text selection from react-pdf-highlighter ---
 
@@ -1089,7 +1229,7 @@ class LibraryState(rx.State):
             f"""(function() {{
               var iframe = document.querySelector('iframe[src*="pdf-reader"]');
               if (iframe && iframe.contentWindow) {{
-                iframe.contentWindow.postMessage({{type: 'REMOVE_HIGHLIGHT', id: {json.dumps(id)}}}, '*');
+                iframe.contentWindow.postMessage({{type: 'REMOVE_HIGHLIGHT', id: {json.dumps(id)}}}, window.location.origin);
               }}
             }})()"""
         )
@@ -1165,7 +1305,7 @@ class LibraryState(rx.State):
                 f"""(function() {{
                   var iframe = document.querySelector('iframe[src*="pdf-reader"]');
                   if (iframe && iframe.contentWindow) {{
-                    iframe.contentWindow.postMessage({{type: 'TRANSLATE_RESULT', id: '{id}', translation: {json.dumps(result)}}}, '*');
+                    iframe.contentWindow.postMessage({{type: 'TRANSLATE_RESULT', id: {json.dumps(id)}, translation: {json.dumps(result)}}}, window.location.origin);
                   }}
                 }})()"""
             )
@@ -1268,7 +1408,7 @@ class LibraryState(rx.State):
                   translation: {json.dumps(self.translation_result)},
                   rects: {self.translation_rects or '[]'},
                   page: {self.translation_page or 0}
-                }}, '*');
+                }}, window.location.origin);
               }}
             }})()"""
         )
@@ -1295,7 +1435,7 @@ class LibraryState(rx.State):
                   result: {json.dumps(entry.get("result", ""))},
                   rects: {entry.get("rects", "[]")},
                   page: {entry.get("page", 0)}
-                }}, '*');
+                }}, window.location.origin);
               }}
             }})()"""
         )
@@ -1311,7 +1451,7 @@ class LibraryState(rx.State):
             """(function() {
               var iframe = document.querySelector('iframe[src*="pdf-reader"]');
               if (iframe && iframe.contentWindow) {
-                iframe.contentWindow.postMessage({type: 'AUTO_TRANSLATE', enabled: false}, '*');
+                iframe.contentWindow.postMessage({type: 'AUTO_TRANSLATE', enabled: false}, window.location.origin);
               }
             })()"""
         )

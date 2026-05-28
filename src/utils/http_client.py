@@ -13,6 +13,24 @@ import httpx
 _client: httpx.AsyncClient | None = None
 
 
+def chat_completions_url(base_url: str) -> str:
+    """Build a chat completions URL from either a base URL or a full endpoint."""
+    url = (base_url or "").strip().rstrip("/")
+    suffix = "/chat/completions"
+    if url.endswith(suffix):
+        return url
+    return f"{url}{suffix}"
+
+
+def chat_message_content(response_json: dict) -> str:
+    """Extract assistant text from OpenAI-compatible chat responses."""
+    message = response_json["choices"][0]["message"]
+    content = (message.get("content") or "").strip()
+    if content:
+        return content
+    return (message.get("reasoning_content") or "").strip()
+
+
 def get_client() -> httpx.AsyncClient:
     """Return the shared async HTTP client (lazy-init, thread-safe)."""
     global _client

@@ -1,7 +1,7 @@
 """Chat streaming and context helpers for the home page."""
 
 from src.core.engine import TranslationEngine
-from src.utils.http_client import get_client
+from src.utils.http_client import chat_completions_url, get_client
 
 MAX_CONTEXT_CHARS = 18000
 
@@ -27,7 +27,7 @@ async def stream_chat_completion(
     client = get_client()
     async with client.stream(
         "POST",
-        f"{engine.base_url.rstrip('/')}/chat/completions",
+        chat_completions_url(engine.base_url),
         headers={"Authorization": f"Bearer {engine.api_key.strip()}"},
         json={
             "model": engine.model,

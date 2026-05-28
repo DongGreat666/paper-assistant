@@ -10,13 +10,22 @@ import re
 from typing import Iterable
 
 from src.core.engine import TranslationEngine, get_default_translation_engine
-from src.utils.http_client import get_client
+from src.utils.http_client import chat_completions_url, chat_message_content, get_client
 
 
 TRANSLATION_CONCURRENCY = 3
 TRANSLATION_MAX_RETRIES = 2
 TRANSLATION_RETRY_BASE_DELAY = 1.5
 TRANSLATION_STOP_POLL_INTERVAL = 0.25
+
+
+_EXPLANATION_MARKERS = (
+    "--- **改写说明**",
+    "---**改写说明**",
+    "**改写说明**",
+    "改写说明：",
+    "说明：",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +109,22 @@ def should_skip_section(section: str) -> bool:
     return False
 
 
+def clean_translation_output(text: str) -> str:
+    """Remove common assistant explanations from translation-only responses."""
+    result = (text or "").strip()
+    for marker in _EXPLANATION_MARKERS:
+        idx = result.find(marker)
+        if idx >= 0:
+            result = result[:idx].strip()
+
+    for prefix in ("译文：", "翻译：", "中文翻译：", "翻译结果："):
+        if result.startswith(prefix):
+            result = result[len(prefix):].strip()
+            break
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Translation via LLM
 # ---------------------------------------------------------------------------
@@ -109,26 +134,33 @@ async def translate_inline(
     text: str,
     engine: TranslationEngine,
 ) -> str:
-    """Fast inline translation for selected text (word/sentence/paragraph).
-
-    Optimized for speed: minimal prompt, no formatting rules.
-    """
+    """Fast inline translation for selected text (word/sentence/paragraph)."""
     messages = [
-        {"role": "system", "content": "将用户输入翻译为中文，直接输出译文。"},
+        {
+            "role": "system",
+            "content": (
+                "你是学术论文翻译器。任务是把用户给出的英文原文忠实翻译成中文。\n"
+                "硬性规则：\n"
+                "1. 只输出中文译文，不要解释、总结、改写说明、标题或客套话。\n"
+                "2. 不要扩写，不要补充原文没有的信息。\n"
+                "3. 保留文献引用、数字、模型名、数据集名和专业术语。\n"
+                "4. 尽量保持原文句子顺序和段落结构。"
+            ),
+        },
         {"role": "user", "content": text},
     ]
     client = get_client()
     response = await client.post(
-        f"{engine.base_url.rstrip('/')}/chat/completions",
+        chat_completions_url(engine.base_url),
         headers={"Authorization": f"Bearer {engine.api_key.strip()}"},
         json={
             "model": engine.model,
             "messages": messages,
-            "temperature": 0.1,
+            "temperature": 0,
         },
     )
     response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
+    return clean_translation_output(chat_message_content(response.json()))
 
 
 async def translate_section(
@@ -143,17 +175,18 @@ async def translate_section(
             "content": (
                 "你是学术论文翻译专家。请将用户提供的英文文本翻译为中文。\n"
                 "规则：\n"
-                "1. 仅输出翻译结果，不要添加解释、注释或额外内容。\n"
-                "2. 保留所有数学公式（LaTeX）、文献引用标记原样不变。\n"
-                "3. 翻译需符合中文学术表达习惯。\n"
-                "4. 如遇 OCR 导致的断行或碎裂单词，自动修复。"
+                "1. 仅输出翻译结果，不要添加解释、总结、改写说明、注释或额外内容。\n"
+                "2. 忠实翻译原文，不要扩写，不要补充原文没有的信息。\n"
+                "3. 保留所有数学公式（LaTeX）、文献引用标记原样不变。\n"
+                "4. 翻译需符合中文学术表达习惯。\n"
+                "5. 如遇 OCR 导致的断行或碎裂单词，自动修复。"
             ),
         },
         {"role": "user", "content": text},
     ]
     client = get_client()
     response = await client.post(
-        f"{engine.base_url.rstrip('/')}/chat/completions",
+        chat_completions_url(engine.base_url),
         headers={"Authorization": f"Bearer {engine.api_key.strip()}"},
         json={
             "model": engine.model,
@@ -162,7 +195,7 @@ async def translate_section(
         },
     )
     response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
+    return clean_translation_output(chat_message_content(response.json()))
 
 
 async def translate_markdown(

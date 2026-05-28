@@ -3,7 +3,7 @@ import type { InMessage } from "./types";
 const SOURCE = "pdf-reader";
 
 export function sendMessage(msg: Record<string, unknown>) {
-  window.parent.postMessage({ ...msg, source: SOURCE }, "*");
+  window.parent.postMessage({ ...msg, source: SOURCE }, window.location.origin);
 }
 
 export function onMessage(callback: (msg: InMessage) => void) {

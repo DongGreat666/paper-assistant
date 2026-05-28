@@ -23,7 +23,9 @@ async def serve_pdf(request: Request):
     full_path = (UPLOAD_DIR / file_path).resolve()
 
     # Security: prevent path traversal
-    if not str(full_path).startswith(str(UPLOAD_DIR)):
+    if not full_path.is_relative_to(UPLOAD_DIR):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    if full_path.suffix.lower() != ".pdf":
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     if not full_path.exists() or not full_path.is_file():
         return JSONResponse({"error": "Not found"}, status_code=404)
@@ -44,9 +46,9 @@ async def pdf_highlights(request: Request):
     if not file_path:
         return JSONResponse([], status_code=200)
 
-    full_path = Path(file_path).resolve()
+    full_path = (UPLOAD_DIR / file_path).resolve()
     # Security: prevent path traversal
-    if not str(full_path).startswith(str(UPLOAD_DIR)):
+    if not full_path.is_relative_to(UPLOAD_DIR):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     if not full_path.exists() or not full_path.is_file():
         return JSONResponse([], status_code=200)

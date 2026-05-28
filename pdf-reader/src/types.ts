@@ -11,6 +11,7 @@ export interface TranslationEntry {
   rects?: { x1: number; y1: number; x2: number; y2: number; pageNumber: number; placement?: boolean }[];
   page?: number;
   pinned?: boolean;
+  kind?: "translation" | "explanation";
 }
 
 // React → Reflex
@@ -73,7 +74,16 @@ export type OutMessage =
   | { source: "pdf-reader"; type: "HIGHLIGHT_CLICKED"; id: string }
   | { source: "pdf-reader"; type: "PAGE_CHANGED"; page: number }
   | { source: "pdf-reader"; type: "UNDO" }
-  | { source: "pdf-reader"; type: "ASK_AI"; action: string }
+  | {
+      source: "pdf-reader";
+      type: "EXPLAIN_REQUEST";
+      id: string;
+      text: string;
+      image?: string;
+      rects: { x1: number; y1: number; x2: number; y2: number; pageNumber: number; placement?: boolean }[];
+      page: number;
+      mode: "floating";
+    }
   | {
       source: "pdf-reader";
       type: "PIN_TRANSLATION";
@@ -91,6 +101,7 @@ export type InMessage =
   | { type: "ADD_HIGHLIGHT"; highlight: IHighlight }
   | { type: "REMOVE_HIGHLIGHT"; id: string }
   | { type: "TRANSLATE_RESULT"; id: string; translation: string }
+  | { type: "EXPLAIN_RESULT"; id: string; explanation: string }
   | { type: "SET_TRANSLATE_MODE"; mode: TranslateDisplayMode }
   | { type: "UNPIN_TRANSLATION"; id: string; text: string; result: string; rects: any[]; page: number }
   | { type: "START_TRANSLATION_PLACEMENT"; id: string; text: string; translation: string; rects: any[]; page: number }

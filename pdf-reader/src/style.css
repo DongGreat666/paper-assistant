@@ -130,6 +130,27 @@ html, body, #root {
   border-right: 1px solid #e5e7eb;
 }
 
+.area-select-btn {
+  width: auto;
+  min-width: 52px;
+  padding: 0 10px;
+  font-size: 12px;
+  color: #374151;
+  border-right: 1px solid #e5e7eb;
+}
+
+.area-select-btn.active {
+  background: #e0f2fe;
+  color: #0369a1;
+  font-weight: 700;
+}
+
+.app.area-select-mode ._container_12oj9_1,
+.app.area-select-mode .pdfViewer,
+.app.area-select-mode .pdfViewer .page {
+  cursor: crosshair !important;
+}
+
 .loading, .error-msg {
   display: flex;
   align-items: center;
@@ -545,8 +566,60 @@ html, body, #root {
 .translation-float-result {
   font-size: 16px;
   color: #111827;
-  line-height: 1.8;
+  line-height: 1.72;
   padding: 12px 14px;
+}
+
+.markdown-result {
+  word-break: break-word;
+}
+
+.markdown-result p {
+  margin: 0 0 10px;
+}
+
+.markdown-result p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-result h1,
+.markdown-result h2,
+.markdown-result h3,
+.markdown-result h4 {
+  margin: 4px 0 8px;
+  color: #111827;
+  font-size: 17px;
+  line-height: 1.45;
+}
+
+.markdown-result ul,
+.markdown-result ol {
+  margin: 6px 0 10px;
+  padding-left: 22px;
+}
+
+.markdown-result li {
+  margin: 3px 0;
+}
+
+.markdown-result strong {
+  font-weight: 700;
+}
+
+.markdown-result code,
+.markdown-result .math-inline {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.markdown-result hr {
+  border: 0;
+  border-top: 1px solid #e5e7eb;
+  margin: 10px 0;
 }
 
 .translation-float-save {

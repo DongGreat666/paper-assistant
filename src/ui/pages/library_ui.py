@@ -135,12 +135,20 @@ def content() -> rx.Component:
             ),
             style={"display": "none"},
         ),
-        # Hidden inputs for ASK_AI
-        rx.el.input(id="pdf-ask-action", type="hidden"),
+        # Hidden inputs for EXPLAIN_REQUEST
+        rx.el.input(id="pdf-explain-id", type="hidden"),
+        rx.el.input(id="pdf-explain-text", type="hidden"),
+        rx.el.input(id="pdf-explain-image", type="hidden"),
+        rx.el.input(id="pdf-explain-rects", type="hidden"),
+        rx.el.input(id="pdf-explain-page", type="hidden"),
         rx.button(
-            id="pdf-ask-trigger",
-            on_click=LibraryState.handle_ask_ai(
-                rx.Var("document.getElementById('pdf-ask-action').value"),
+            id="pdf-explain-trigger",
+            on_click=LibraryState.handle_explain_request(
+                rx.Var("document.getElementById('pdf-explain-id').value"),
+                rx.Var("document.getElementById('pdf-explain-text').value"),
+                rx.Var("document.getElementById('pdf-explain-image').value"),
+                rx.Var("document.getElementById('pdf-explain-rects').value"),
+                rx.Var("parseInt(document.getElementById('pdf-explain-page').value) || 0"),
             ),
             style={"display": "none"},
         ),
@@ -227,9 +235,13 @@ window.__pdfBridge.on('library-page', function(msg) {
     document.getElementById('pdf-pin-page').value = msg.page || 0;
     document.getElementById('pdf-pin-trigger').click();
   }
-  if (msg.type === 'ASK_AI' && msg.action) {
-    document.getElementById('pdf-ask-action').value = msg.action || '';
-    document.getElementById('pdf-ask-trigger').click();
+  if (msg.type === 'EXPLAIN_REQUEST') {
+    document.getElementById('pdf-explain-id').value = msg.id || '';
+    document.getElementById('pdf-explain-text').value = msg.text || '';
+    document.getElementById('pdf-explain-image').value = msg.image || '';
+    document.getElementById('pdf-explain-rects').value = JSON.stringify(msg.rects || []);
+    document.getElementById('pdf-explain-page').value = msg.page || 0;
+    document.getElementById('pdf-explain-trigger').click();
   }
   if (msg.type === 'PAGE_CHANGED') {
     document.getElementById('pdf-page-num').value = msg.page || 0;

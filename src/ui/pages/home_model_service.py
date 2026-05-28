@@ -8,6 +8,7 @@ from src.core.engine import (
     api_key_display,
     build_engine,
     build_engine_from_profile,
+    delete_api_secret_refs,
     externalize_profile_api_key,
     get_default_translation_engine,
     has_usable_api_key,
@@ -15,7 +16,7 @@ from src.core.engine import (
     profile_has_api_key,
     save_engine_profiles,
 )
-from src.utils.http_client import get_client
+from src.utils.http_client import chat_completions_url, chat_message_content, get_client
 
 
 def resolve_model_defaults() -> dict:
@@ -64,10 +65,22 @@ def persist_home_model(
     engine_temperature: str,
     engine_name: str,
 ) -> None:
+    # Externalize API key to secrets.json — never write plaintext keys to settings
+    key_to_store = ""
+    stripped = engine_api_key.strip()
+    if stripped:
+        if stripped.startswith("ref:"):
+            key_to_store = stripped
+        else:
+            profile = externalize_profile_api_key(
+                {"id": selected_engine_id or "home-model", "api_key": stripped},
+                "home",
+            )
+            key_to_store = api_key_display(profile)
     write_settings({
         "home_model_auto": model_auto,
         "home_selected_engine_id": selected_engine_id,
-        "home_engine_api_key": engine_api_key if not engine_api_key.startswith("sk-") else "",
+        "home_engine_api_key": key_to_store,
         "home_engine_base_url": engine_base_url,
         "home_engine_model": engine_model,
         "home_engine_temperature": engine_temperature,
@@ -144,6 +157,18 @@ def upsert_profile(profiles: list[dict], profile: dict, editing_engine_id: str) 
 
 
 def remove_profile(profiles: list[dict], profile_id: str) -> list[dict]:
+    removed = [item for item in profiles if item.get("id") == profile_id]
+    refs = [
+        ref
+        for item in removed
+        for ref in [
+            item.get("api_key_ref", ""),
+            f"engine:{profile_id}",
+            f"chat:{profile_id}",
+            f"home:{profile_id}",
+        ]
+    ]
+    delete_api_secret_refs(refs)
     updated = [item for item in profiles if item.get("id") != profile_id]
     save_engine_profiles(updated)
     return load_engine_profiles()
@@ -181,7 +206,7 @@ async def chat_completion(
 ) -> str:
     client = get_client()
     response = await client.post(
-        f"{engine.base_url.rstrip('/')}/chat/completions",
+        chat_completions_url(engine.base_url),
         headers={"Authorization": f"Bearer {engine.api_key.strip()}"},
         json={
             "model": engine.model,
@@ -191,12 +216,12 @@ async def chat_completion(
         },
     )
     response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
+    return chat_message_content(response.json())
 
 
 async def test_profile(profile: dict) -> None:
-    engine = build_engine_from_profile({**profile, "temperature": 0.1}, default_profile="qa")
-    await chat_completion([{"role": "user", "content": "Hi"}], engine, max_tokens=5)
+    engine = build_engine_from_profile(profile, default_profile="qa")
+    await chat_completion([{"role": "user", "content": "Reply briefly: OK"}], engine, max_tokens=200)
 
 
 def select_engine_action(profiles: list[dict], profile_id: str) -> dict | None:

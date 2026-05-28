@@ -1,4 +1,4 @@
-"""Context-Aware Workspace Chat engine.
+"""Context-aware workspace chat engine.
 
 Provides PDF text extraction (PyMuPDF) and LLM chat with context injection.
 """
@@ -8,7 +8,7 @@ from __future__ import annotations
 import fitz  # PyMuPDF
 
 from src.core.engine import TranslationEngine
-from src.utils.http_client import get_client
+from src.utils.http_client import chat_completions_url, chat_message_content, get_client
 
 
 # ---------------------------------------------------------------------------
@@ -27,19 +27,26 @@ def extract_page_text(pdf_path: str, page_num: int) -> str:
     return text.strip()
 
 
-def extract_full_text(pdf_path: str, max_chars: int = 30000) -> str:
-    """Extract full document text, truncated to max_chars."""
+def extract_full_text(pdf_path: str, max_chars: int = 60000) -> str:
+    """Extract document text quickly with page markers, truncated to max_chars."""
     doc = fitz.open(pdf_path)
     try:
         parts: list[str] = []
         total = 0
-        for page in doc:
-            t = page.get_text("text")
-            if total + len(t) > max_chars:
-                parts.append(t[: max_chars - total])
+        for page_index, page in enumerate(doc, start=1):
+            text = page.get_text("text").strip()
+            if not text:
+                continue
+            block = f"\n\n## Page {page_index}\n\n{text}"
+            remaining = max_chars - total
+            if remaining <= 0:
                 break
-            parts.append(t)
-            total += len(t)
+            if len(block) > remaining:
+                parts.append(block[:remaining])
+                parts.append("\n\n[内容已截断，仅保留前部文本用于快速问答。]")
+                break
+            parts.append(block)
+            total += len(block)
         return "\n".join(parts).strip()
     finally:
         doc.close()
@@ -51,16 +58,14 @@ def extract_nearby_text(
     selected_text: str,
     context_chars: int = 2000,
 ) -> str:
-    """Extract paragraphs near the selected text (context_chars/2 before and after)."""
+    """Extract paragraphs near the selected text."""
     page_text = extract_page_text(pdf_path, page_num)
     if not page_text or not selected_text:
         return page_text[:context_chars]
 
-    # Try to locate the selected text in the page (use first 50 chars as anchor)
     anchor = selected_text[:50].strip()
     idx = page_text.find(anchor)
     if idx < 0:
-        # Fallback: return the first context_chars of the page
         return page_text[:context_chars]
 
     half = context_chars // 2
@@ -81,7 +86,7 @@ async def chat_with_context(
     """Call an OpenAI-compatible chat completions endpoint."""
     client = get_client()
     response = await client.post(
-        f"{engine.base_url.rstrip('/')}/chat/completions",
+        chat_completions_url(engine.base_url),
         headers={"Authorization": f"Bearer {engine.api_key.strip()}"},
         json={
             "model": engine.model,
@@ -91,7 +96,7 @@ async def chat_with_context(
         },
     )
     response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
+    return chat_message_content(response.json())
 
 
 # ---------------------------------------------------------------------------
@@ -113,19 +118,19 @@ def build_chat_messages(
     system = (
         "你是一个学术论文阅读助手。用户正在阅读一篇论文，"
         "请根据提供的上下文回答问题。回答要简洁、准确、有条理。"
-        "如果上下文不足以回答，请说明。"
+        "如果上下文不足以回答，请明确说明。"
     )
 
-    # Assemble context sections
     ctx = [f"## 当前论文\n{paper_title}"]
 
     if selected_text:
-        ctx.append(f"## 选中文本\n{selected_text}")
+        ctx.append(f"## 重点选中文本\n{selected_text}")
 
-    if scope == "paper" and full_text:
-        ctx.append(f"## 论文全文（节选）\n{full_text}")
-    elif selected_text and nearby_text:
+    if selected_text and nearby_text:
         ctx.append(f"## 选区附近段落\n{nearby_text}")
+
+    if full_text:
+        ctx.append(f"## 论文全文背景（节选）\n{full_text}")
 
     if annotations:
         ann_lines = "\n".join(
@@ -134,14 +139,17 @@ def build_chat_messages(
         )
         ctx.append(f"## 用户已有注释\n{ann_lines}")
 
+    if scope == "paper":
+        ctx.append("## 回答侧重点\n优先从整篇论文视角回答。")
+    else:
+        ctx.append("## 回答侧重点\n优先围绕选中文本或用户当前问题回答，必要时结合全文背景。")
+
     system += "\n\n" + "\n\n".join(ctx)
 
-    # Build user message — inline selected text for highest priority
     user_content = user_query
     if selected_text:
         user_content = f"关于以下选中文本：\n\n{selected_text}\n\n---\n\n{user_query}"
 
-    # Build final messages list
     msgs: list[dict] = [{"role": "system", "content": system}]
     for h in chat_history[-10:]:
         msgs.append({"role": h["role"], "content": h["content"]})

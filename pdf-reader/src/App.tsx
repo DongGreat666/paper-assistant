@@ -17,11 +17,21 @@ import "./style.css";
 const params = new URLSearchParams(window.location.search);
 const fileUrl = params.get("file") || "";
 
+// In Reflex dev mode, frontend (3000) and backend (8000) run on different ports.
+// The parent page can pass ?backend=<origin> to specify the API origin.
+// Otherwise, default dev port mapping: 3000 -> 8000; production: same origin.
+function resolveBackendOrigin(): string {
+  const explicit = params.get("backend");
+  if (explicit) return explicit;
+  const { protocol, hostname, port } = window.location;
+  if (port === "3000") return `${protocol}//${hostname}:8000`;
+  return window.location.origin;
+}
+const backendOrigin = resolveBackendOrigin();
+
 function getBackendUrl(url: string): string {
   if (url.startsWith("/api/")) {
-    const origin =
-      window.location.protocol + "//" + window.location.hostname + ":8000";
-    return origin + url;
+    return backendOrigin + url;
   }
   return url;
 }
@@ -178,6 +188,93 @@ function mergeSelectionRects(position: ScaledPosition): ScaledPosition {
   } as ScaledPosition;
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderInlineMarkdown(value: string): string {
+  let html = escapeHtml(value);
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/\$([^$\n]+)\$/g, '<span class="math-inline">$1</span>');
+  return html;
+}
+
+function markdownToHtml(markdown: string): string {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const blocks: string[] = [];
+  let paragraph: string[] = [];
+  let listItems: string[] = [];
+  let ordered = false;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    blocks.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!listItems.length) return;
+    const tag = ordered ? "ol" : "ul";
+    blocks.push(`<${tag}>${listItems.join("")}</${tag}>`);
+    listItems = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    if (/^[-*_]{3,}$/.test(line)) {
+      flushParagraph();
+      flushList();
+      blocks.push("<hr />");
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = Math.min(heading[1].length, 4);
+      blocks.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+    const unorderedItem = /^[-*]\s+(.+)$/.exec(line);
+    const orderedItem = /^\d+[.)]\s+(.+)$/.exec(line);
+    if (unorderedItem || orderedItem) {
+      flushParagraph();
+      const isOrdered = Boolean(orderedItem);
+      if (listItems.length && ordered !== isOrdered) flushList();
+      ordered = isOrdered;
+      const text = unorderedItem ? unorderedItem[1] : orderedItem![1];
+      listItems.push(`<li>${renderInlineMarkdown(text)}</li>`);
+      continue;
+    }
+    flushList();
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+  return blocks.join("");
+}
+
+function MarkdownResult({ text }: { text: string }) {
+  return (
+    <div
+      className="translation-float-result markdown-result"
+      dangerouslySetInnerHTML={{ __html: markdownToHtml(text) }}
+    />
+  );
+}
+
 // ─── Floating Selection Toolbar (WPS-style) ────────────────────────
 
 function SelectionToolbar({
@@ -189,6 +286,7 @@ function SelectionToolbar({
   onTranslate,
   onAnnotate,
   onCopy,
+  onExplain,
 }: {
   position: { x: number; y: number; above: boolean };
   onClose: () => void;
@@ -198,13 +296,14 @@ function SelectionToolbar({
   onTranslate: () => void;
   onAnnotate: () => void;
   onCopy: () => void;
+  onExplain: () => void;
 }) {
   const [expandColor, setExpandColor] = useState<"highlight" | "underline" | null>(null);
   const ref = useRef<HTMLDivElement>(null);
 
   // Close on outside click (use ref to avoid stale closure)
   const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
+  useEffect(() => { onCloseRef.current = onClose; });
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) {
@@ -315,7 +414,7 @@ function SelectionToolbar({
       <div className="stb-sep" />
 
       {/* Section C: AI */}
-      <button className="stb-btn stb-ai-btn" title="问问 AI" onClick={() => { sendMessage({ type: "ASK_AI", action: "explain" }); onClose(); }}>
+      <button className="stb-btn stb-ai-btn" title="解释" onClick={() => { onExplain(); onClose(); }}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/>
         </svg>
@@ -405,18 +504,20 @@ function FloatTrans({ entry, onClose, onSave, onPin }: {
       style={{ left: pos.x, top: pos.y }}
     >
       <div className="translation-float-header" onMouseDown={onMouseDown}>
-        <span className="translation-float-title">翻译</span>
+        <span className="translation-float-title">{entry.kind === "explanation" ? "解释" : "翻译"}</span>
         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-          <button className="translation-float-pin" onClick={onPin} title="固定到右侧翻译栏">固定</button>
+          {entry.kind !== "explanation" && (
+            <button className="translation-float-pin" onClick={onPin} title="固定到右侧翻译栏">固定</button>
+          )}
           <button className="translation-float-close" onClick={onClose}>&times;</button>
         </div>
       </div>
       {entry.loading ? (
-        <div className="translation-float-loading">翻译中...</div>
+        <div className="translation-float-loading">{entry.kind === "explanation" ? "解释中..." : "翻译中..."}</div>
       ) : (
-        <div className="translation-float-result">{entry.result || "翻译失败"}</div>
+        <MarkdownResult text={entry.result || (entry.kind === "explanation" ? "解释失败" : "翻译失败")} />
       )}
-      {!entry.loading && entry.result && (
+      {entry.kind !== "explanation" && !entry.loading && entry.result && (
         <button className="translation-float-save" onClick={onSave}>
           保存到 PDF
         </button>
@@ -510,6 +611,7 @@ function App() {
   const [floatingAutoTranslate, setFloatingAutoTranslate] = useState(false);
   const [scaleValue, setScaleValue] = useState(1.0);
   const [fitWidth, setFitWidth] = useState(true); // true = fit-width mode, false = manual scale
+  const [areaSelectMode, setAreaSelectMode] = useState(false);
   // Translation entries (shared by both modes)
   const [translations, setTranslations] = useState<TranslationEntry[]>([]);
   const [placement, setPlacement] = useState<TranslationEntry | null>(null);
@@ -572,6 +674,13 @@ function App() {
           );
           break;
         }
+        case "EXPLAIN_RESULT": {
+          const { id, explanation } = msg;
+          setTranslations((prev) =>
+            prev.map((t) => t.id === id ? { ...t, loading: false, result: explanation } : t)
+          );
+          break;
+        }
         case "UNPIN_TRANSLATION": {
           const entry: TranslationEntry = {
             id: msg.id,
@@ -611,6 +720,14 @@ function App() {
     });
   }, [placementMode]);
 
+  const undoLast = useCallback(() => {
+    const current = highlightsRef.current;
+    if (current.length === 0) return;
+    const last = current[current.length - 1];
+    setHighlights(current.slice(0, -1));
+    sendMessage({ type: "HIGHLIGHT_DELETED", id: last.id });
+  }, []);
+
   // Ctrl+Z undo
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -621,15 +738,7 @@ function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
-
-  const undoLast = useCallback(() => {
-    const current = highlightsRef.current;
-    if (current.length === 0) return;
-    const last = current[current.length - 1];
-    setHighlights(current.slice(0, -1));
-    sendMessage({ type: "HIGHLIGHT_DELETED", id: last.id });
-  }, []);
+  }, [undoLast]);
 
   // Toolbar: highlight with specific color
   const toolbarHighlight = useCallback(
@@ -767,6 +876,41 @@ function App() {
     });
   }, []);
 
+  const requestExplanationForSelection = useCallback((
+    position: ScaledPosition,
+    content: Content,
+    image?: string
+  ) => {
+    const id = genId();
+    const text = (content.text || "").trim();
+    const normalizedPosition = mergeSelectionRects(position);
+    const rects = (normalizedPosition.rects || []).map((r: any) => ({
+      x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2, pageNumber: r.pageNumber,
+    }));
+    const page = normalizedPosition.pageNumber || (rects[0]?.pageNumber) || 0;
+    const entry: TranslationEntry = {
+      id,
+      text: text || "框选区域",
+      loading: true,
+      rects,
+      page,
+      kind: "explanation",
+    };
+    setTranslations((prev) => {
+      const pinned = prev.filter((t) => t.pinned);
+      return [entry, ...pinned];
+    });
+    sendMessage({
+      type: "EXPLAIN_REQUEST",
+      id,
+      text,
+      image,
+      rects,
+      page,
+      mode: "floating",
+    });
+  }, []);
+
   const requestTranslation = useCallback(() => {
     if (!pendingSelection) return;
     requestTranslationForSelection(mergeSelectionRects(pendingSelection.position), pendingSelection.content, "floating");
@@ -775,6 +919,23 @@ function App() {
     setPendingSelection(null);
     setToolbarPos(null);
   }, [pendingSelection, requestTranslationForSelection]);
+
+  const requestExplanation = useCallback(() => {
+    if (!pendingSelection) return;
+    requestExplanationForSelection(
+      mergeSelectionRects(pendingSelection.position),
+      pendingSelection.content,
+      (pendingSelection.content as any).image
+    );
+    setPendingSelection(null);
+    setToolbarPos(null);
+  }, [pendingSelection, requestExplanationForSelection]);
+
+  const toggleAreaSelectMode = useCallback(() => {
+    setAreaSelectMode((enabled) => !enabled);
+    setPendingSelection(null);
+    setToolbarPos(null);
+  }, []);
 
   // Save translation to PDF (float mode)
   const saveTranslationToPdf = useCallback((entry: TranslationEntry) => {
@@ -840,7 +1001,7 @@ function App() {
     }
     setTranslations((prev) => prev.filter((t) => t.id !== entry.id));
     setPlacement(null);
-  }, []);
+  }, [placementMode]);
 
   // Close translation entry (sidebar mode)
   const closeTranslation = useCallback((id: string) => {
@@ -1140,7 +1301,6 @@ function App() {
     });
   }, []);
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const highlightTransform = useCallback(
     (
       highlight: any,
@@ -1233,7 +1393,7 @@ function App() {
   }
 
   return (
-    <div className={`app ${fitWidth ? "fit-width" : "manual-zoom"}`}>
+    <div className={`app ${fitWidth ? "fit-width" : "manual-zoom"} ${areaSelectMode ? "area-select-mode" : ""}`}>
       {/* WPS-style floating selection toolbar */}
       {pendingSelection && toolbarPos && !showAnnotationInput && (
         <SelectionToolbar
@@ -1245,6 +1405,7 @@ function App() {
           onTranslate={requestTranslation}
           onAnnotate={startAnnotation}
           onCopy={copyText}
+          onExplain={requestExplanation}
         />
       )}
 
@@ -1306,6 +1467,13 @@ function App() {
 
       {/* Zoom controls */}
       <div className="zoom-controls">
+        <button
+          className={`zoom-btn area-select-btn ${areaSelectMode ? "active" : ""}`}
+          onClick={toggleAreaSelectMode}
+          title={areaSelectMode ? "退出框选" : "框选图、公式或区域"}
+        >
+          框选
+        </button>
         <button className="zoom-btn" onClick={zoomOut} title="缩小">−</button>
         <button className="zoom-btn zoom-label" onClick={fitWidth ? zoomReset : zoomFitWidth} title={fitWidth ? "重置" : "适应宽度"}>
           {fitWidth ? "适应" : `${Math.round(scaleValue * 100)}%`}
@@ -1323,7 +1491,7 @@ function App() {
             ref={pdfHighlighterRef}
             pdfDocument={pdfDocument}
             pdfScaleValue={pdfScaleProp}
-            enableAreaSelection={(event) => event.altKey}
+            enableAreaSelection={(event) => areaSelectMode || event.altKey}
             onScrollChange={((...args: unknown[]) => {
               const page = Number(args[1] || 0);
               sendPageChanged(page);
@@ -1335,20 +1503,34 @@ function App() {
               position: ScaledPosition,
               content: Content,
               hideTipAndSelection: () => void,
-              _transformSelection: () => void
+              _transformSelection: () => void,
+              screenshot?: (position: ScaledPosition) => string
             ) => {
               const text = content.text || "";
-              if (text.trim()) {
+              const isAreaSelection = areaSelectMode || !text.trim();
+              const image = isAreaSelection
+                ? ((content as any).image || (screenshot ? screenshot(position) : ""))
+                : "";
+              const hasSelection = Boolean(text.trim() || image || position.boundingRect);
+              if (hasSelection) {
+                if (areaSelectMode) {
+                  setAreaSelectMode(false);
+                }
                 // Always send SELECT for chat reference
-                sendMessage({ type: "SELECT", text, position });
+                if (text.trim()) {
+                  sendMessage({ type: "SELECT", text, position });
+                }
 
-                if (autoTranslateRef.current) {
+                if (text.trim() && autoTranslateRef.current) {
                   requestTranslationForSelection(position, content, "sidebar");
-                } else if (floatingAutoTranslateRef.current) {
+                } else if (text.trim() && floatingAutoTranslateRef.current) {
                   requestTranslationForSelection(position, content, "floating");
                 }
                 // Always show toolbar for highlight / AI / translate actions
-                setPendingSelection({ position, content });
+                setPendingSelection({
+                  position,
+                  content: image ? ({ ...content, image } as Content) : content,
+                });
                 if (position.boundingRect) {
                   updateToolbarPos(position.boundingRect);
                 }

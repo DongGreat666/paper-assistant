@@ -22,6 +22,12 @@ class SettingsState(rx.State):
     data_dir: str = _sd.get("data_dir") or str(_cfg.data_dir)
     status_message: str = ""
 
+    # Reading preferences (persisted in settings.json)
+    pref_show_chat_on_open: bool = _sd.get("pref_show_chat_on_open", True)
+    pref_auto_translate: bool = _sd.get("pref_auto_translate", True)
+    pref_auto_preview: bool = _sd.get("pref_auto_preview", True)
+    pref_save_notes_to_paper_dir: bool = _sd.get("pref_save_notes_to_paper_dir", True)
+
     def set_user_name(self, value: str):
         self.user_name = value
 
@@ -43,6 +49,18 @@ class SettingsState(rx.State):
     def set_data_dir(self, value: str):
         self.data_dir = value
 
+    def toggle_pref_show_chat_on_open(self, value: bool):
+        self.pref_show_chat_on_open = value
+
+    def toggle_pref_auto_translate(self, value: bool):
+        self.pref_auto_translate = value
+
+    def toggle_pref_auto_preview(self, value: bool):
+        self.pref_auto_preview = value
+
+    def toggle_pref_save_notes_to_paper_dir(self, value: bool):
+        self.pref_save_notes_to_paper_dir = value
+
     def save(self):
         write_settings({
             "user_name": self.user_name,
@@ -52,6 +70,10 @@ class SettingsState(rx.State):
             "qa_model": self.qa_model,
             "papers_dir": self.papers_dir,
             "data_dir": self.data_dir,
+            "pref_show_chat_on_open": self.pref_show_chat_on_open,
+            "pref_auto_translate": self.pref_auto_translate,
+            "pref_auto_preview": self.pref_auto_preview,
+            "pref_save_notes_to_paper_dir": self.pref_save_notes_to_paper_dir,
         })
         # Reload Config so model/path changes take effect immediately
         get_config().reload()
@@ -212,10 +234,27 @@ def preference_panel() -> rx.Component:
     return panel(
         rx.vstack(
             section_title("阅读偏好", "默认打开论文后的阅读和翻译行为。"),
-            rx.checkbox("打开论文后显示右侧大模型对话", default_checked=True),
-            rx.checkbox("划词后自动显示翻译浮层", default_checked=True),
-            rx.checkbox("整篇翻译完成后自动进入左右对照预览", default_checked=True),
-            rx.checkbox("保存批注和笔记到论文同级目录", default_checked=True),
+            rx.checkbox(
+                "打开论文后显示右侧大模型对话",
+                checked=SettingsState.pref_show_chat_on_open,
+                on_change=SettingsState.toggle_pref_show_chat_on_open,
+            ),
+            rx.checkbox(
+                "划词后自动显示翻译浮层",
+                checked=SettingsState.pref_auto_translate,
+                on_change=SettingsState.toggle_pref_auto_translate,
+            ),
+            rx.checkbox(
+                "整篇翻译完成后自动进入左右对照预览（即将推出）",
+                checked=SettingsState.pref_auto_preview,
+                on_change=SettingsState.toggle_pref_auto_preview,
+                disabled=True,
+            ),
+            rx.checkbox(
+                "保存批注和笔记到论文同级目录",
+                checked=SettingsState.pref_save_notes_to_paper_dir,
+                on_change=SettingsState.toggle_pref_save_notes_to_paper_dir,
+            ),
             spacing="3",
             align_items="start",
         ),

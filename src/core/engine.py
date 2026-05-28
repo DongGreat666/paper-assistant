@@ -68,6 +68,21 @@ def save_api_secrets(secrets: dict[str, str]) -> None:
     )
 
 
+def delete_api_secret_refs(refs: list[str]) -> None:
+    """Remove API key references from the local secret store."""
+    refs = [ref for ref in refs if ref]
+    if not refs:
+        return
+    secrets = load_api_secrets()
+    changed = False
+    for ref in refs:
+        if ref in secrets:
+            secrets.pop(ref, None)
+            changed = True
+    if changed:
+        save_api_secrets(secrets)
+
+
 def make_api_key_ref(profile: dict, namespace: str = "engine") -> str:
     """Create a stable reference name for a profile's API key."""
     existing = (profile.get("api_key_ref") or "").strip()
@@ -280,8 +295,6 @@ def load_engine_profiles() -> list[dict]:
             profile["model"] = preset["model"]
             profile["temperature"] = preset["temperature"]
 
-    existing_ids = {p.get("id") for p in profiles}
-    profiles.extend(p for p in defaults if p["id"] not in existing_ids)
     profiles = [
         p
         for p in profiles
@@ -326,12 +339,8 @@ def load_chat_engine_profiles() -> list[dict]:
         return defaults
 
     data = _read_json(CHAT_ENGINE_PROFILES_PATH, [])
-    if not data:
-        return defaults
 
     profiles = externalize_profiles(data, "chat")
-    if not any(profile.get("id") == "env-default" for profile in profiles):
-        profiles.insert(0, defaults[0])
     for profile in profiles:
         profile.pop("api_key", None)
 

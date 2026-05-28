@@ -160,9 +160,15 @@ class Config:
         return cls._instance
 
     def reload(self) -> None:
-        """Reload config from .env (useful after changing settings)."""
-        Config._instance = None
-        self.__class__.get()
+        """Reload config from .env and settings.json in-place.
+
+        Updates this instance's attributes so that all existing
+        references (e.g. ``cfg = get_config()``) see the new values.
+        """
+        fresh = Config.__new__(Config)
+        fresh.__init__()
+        self.__dict__.update(fresh.__dict__)
+        Config._instance = self
 
     def get_model_for(self, task: str) -> tuple[str, float]:
         """Get model name and temperature for a specific task.

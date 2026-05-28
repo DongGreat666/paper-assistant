@@ -352,10 +352,11 @@ class TranslateState(rx.State):
             )
             unload_marker_models()
 
-            if _is_cancelled(token):
+            if _is_cancelled(token) or self.stop_requested:
                 async with self:
                     self._log("已停止解析")
                     self.status_message = "解析已停止。"
+                    self.is_parsing = False
                 return
 
             if not md_text or not md_text.strip():
@@ -365,10 +366,11 @@ class TranslateState(rx.State):
                 return
 
             # Check cancel BEFORE any disk writes (P1 fix)
-            if _is_cancelled(token):
+            if _is_cancelled(token) or self.stop_requested:
                 async with self:
                     self._log("已停止解析")
                     self.status_message = "解析已停止。"
+                    self.is_parsing = False
                 return
 
             async with self:
@@ -464,13 +466,14 @@ class TranslateState(rx.State):
             # Heavy translation work — runs outside the state lock
             result = await translate_markdown(
                 original_md, engine=engine, on_progress=on_progress,
-                should_stop=lambda: _is_cancelled(token),
+                should_stop=lambda: _is_cancelled(token) or self.stop_requested,
             )
 
-            if _is_cancelled(token):
+            if _is_cancelled(token) or self.stop_requested:
                 async with self:
                     self._log("已停止翻译")
                     self.status_message = "翻译已停止。"
+                    self.is_translating = False
                 return
 
             result_fixed = fix_markdown(result)
@@ -610,7 +613,7 @@ class TranslateState(rx.State):
         if token:
             _cancel_task(token)
         self.stop_requested = True
-        self.status_message = "正在停止当前任务..."
+        self.status_message = "正在停止，等待当前步骤完成..."
         self._log("正在停止...")
         yield
 
