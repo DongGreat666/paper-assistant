@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from scripts.fix_md_refs import fix_markdown
 from src.core.document_parser import (
+    parse_pdf_to_markdown,
     parse_docx_to_markdown,
+    save_markdown,
 )
 
 
@@ -97,29 +98,24 @@ async def save_upload(upload: Any) -> SavedUpload:
 async def prepare_document(upload: SavedUpload) -> str:
     """Create or reuse markdown context for a saved upload."""
     md_path = upload.folder / f"{upload.stem}.md"
-    quick_md_path = upload.folder / f"{upload.stem}_quick.md"
     loop = asyncio.get_event_loop()
 
     if upload.suffix == ".pdf":
-        if quick_md_path.exists():
-            return quick_md_path.read_text(encoding="utf-8")
-        md_text = await loop.run_in_executor(None, extract_pdf_text_fast, upload.destination)
-        quick_md_path.write_text(md_text, encoding="utf-8")
+        pdf_md_path = upload.destination.with_suffix(".md")
+        if pdf_md_path.exists():
+            return pdf_md_path.read_text(encoding="utf-8")
+        md_text, images = await loop.run_in_executor(None, parse_pdf_to_markdown, upload.destination)
+        await loop.run_in_executor(None, save_markdown, md_text, upload.destination, images)
         return md_text
 
     if md_path.exists():
-        original_text = md_path.read_text(encoding="utf-8")
-        md_text = await loop.run_in_executor(None, lambda: fix_markdown(original_text))
-        if md_text != original_text:
-            md_path.write_text(md_text, encoding="utf-8")
-        return md_text
+        return md_path.read_text(encoding="utf-8")
 
     if upload.suffix in (".md", ".txt"):
         md_text = upload.data.decode("utf-8", errors="replace")
         if upload.suffix == ".txt":
             display_name = Path(upload.safe_name).stem
             md_text = f"# {display_name}\n\n{md_text}"
-        md_text = await loop.run_in_executor(None, fix_markdown, md_text)
         md_path.write_text(md_text, encoding="utf-8")
         return md_text
 
@@ -129,9 +125,6 @@ async def prepare_document(upload: SavedUpload) -> str:
             parse_docx_to_markdown,
             str(upload.destination),
         )
-        raw_path = upload.folder / f"{upload.stem}_raw.md"
-        raw_path.write_text(md_text, encoding="utf-8")
-        md_text = await loop.run_in_executor(None, fix_markdown, md_text)
         md_path.write_text(md_text, encoding="utf-8")
         return md_text
 

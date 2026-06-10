@@ -13,6 +13,7 @@ Schema:
 """
 
 import json
+import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,6 +21,16 @@ from pathlib import Path
 from config import get_config
 
 HISTORY_DIR: Path = get_config().chat_history_dir
+_CONVERSATION_ID_PATTERN = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _conversation_path(conv_id: str) -> Path | None:
+    """Return the bounded history path for a valid conversation ID."""
+    if not isinstance(conv_id, str) or not _CONVERSATION_ID_PATTERN.fullmatch(conv_id):
+        return None
+    history_root = HISTORY_DIR.resolve()
+    path = (history_root / f"{conv_id}.json").resolve()
+    return path if path.parent == history_root else None
 
 
 def _now_iso() -> str:
@@ -52,16 +63,18 @@ def new_conversation(paper: str = "", messages: list[dict] | None = None, engine
 
 def save(conv: dict) -> None:
     """Write conversation to disk."""
+    path = _conversation_path(conv.get("id", ""))
+    if path is None:
+        raise ValueError("Invalid conversation ID")
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     conv["updated_at"] = _now_iso()
-    path = HISTORY_DIR / f"{conv['id']}.json"
     path.write_text(json.dumps(conv, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load(conv_id: str) -> dict | None:
     """Load a conversation by id."""
-    path = HISTORY_DIR / f"{conv_id}.json"
-    if not path.exists():
+    path = _conversation_path(conv_id)
+    if path is None or not path.exists():
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -71,11 +84,14 @@ def load(conv_id: str) -> dict | None:
 
 def delete(conv_id: str) -> bool:
     """Delete a conversation file."""
-    path = HISTORY_DIR / f"{conv_id}.json"
-    if path.exists():
+    path = _conversation_path(conv_id)
+    if path is None or not path.exists():
+        return False
+    try:
         path.unlink()
         return True
-    return False
+    except OSError:
+        return False
 
 
 def list_conversations() -> list[dict]:
@@ -92,6 +108,8 @@ def list_conversations() -> list[dict]:
     yesterday = today - timedelta(days=1)
 
     for path in HISTORY_DIR.glob("*.json"):
+        if not _CONVERSATION_ID_PATTERN.fullmatch(path.stem):
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -111,7 +129,7 @@ def list_conversations() -> list[dict]:
             time_label = ""
 
         summaries.append({
-            "id": data.get("id", path.stem),
+            "id": path.stem,
             "title": data.get("title", "未命名对话"),
             "paper": data.get("paper", ""),
             "engine": data.get("engine", ""),

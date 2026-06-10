@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,7 +14,9 @@ from urllib.parse import quote
 
 import reflex as rx
 
-from src.core.pdf_annotations import read_highlights, add_highlight, add_underline, add_strikethrough, delete_highlight, add_text_annot, add_freetext_annot, move_freetext_annot
+logger = logging.getLogger(__name__)
+
+from src.core.pdf_annotations import read_highlights, add_highlight, add_underline, add_strikethrough, delete_highlight, add_text_annot, add_freetext_annot, move_freetext_annot, update_annotation_comment
 from src.core.engine import (
     TranslationEngine,
     api_key_display,
@@ -29,8 +32,9 @@ from src.core.engine import (
 from src.core.translator import translate_inline, translate_section
 from src.core.chat_engine import extract_nearby_text, extract_full_text, build_chat_messages, chat_with_context
 from config import read_settings
+from paths import PROJECT_ROOT
 
-UPLOAD_DIR = Path("uploaded_files")
+UPLOAD_DIR = PROJECT_ROOT / "uploaded_files"
 
 
 @dataclass
@@ -106,7 +110,7 @@ class LibraryState(rx.State):
 
     selected_paper: str = ""
     selected_folder: str = ""
-    selected_pdf_path: str = ""  # actual file path for annotation read/write
+    selected_pdf_path: str = ""  # relative to uploaded_files/, e.g. "folder/paper.pdf"
     pdf_reader_url: str = ""
     note_text: str = ""
     chat_input: str = ""
@@ -114,6 +118,7 @@ class LibraryState(rx.State):
     # Panel visibility
     left_open: bool = False
     right_open: bool = False
+    right_panel_width: int = 360
     focus_mode: bool = False
 
     # Text selection & translation
@@ -150,11 +155,12 @@ class LibraryState(rx.State):
     editing_paper_path: str = ""
     editing_paper_value: str = ""
     annotations: list[dict] = []
+    editing_annotation_id: str = ""
+    editing_annotation_note: str = ""
 
     # Chat state
     chat_messages: list[dict] = []  # [{role, content}]
     chat_loading: bool = False
-    chat_scope: str = "selection"  # "selection" | "paper"
     selected_page: int = 0  # current page number from PAGE_CHANGED
 
     # Chat engine config (independent, only configured in model tab)
@@ -224,6 +230,57 @@ class LibraryState(rx.State):
             if e.get("result") == self.translation_result:
                 return e.get("id", "")
         return ""
+
+    @rx.var
+    def right_panel_width_css(self) -> str:
+        return f"{self.right_panel_width}px"
+
+    @rx.var
+    def right_panel_hidden_margin_css(self) -> str:
+        return f"-{self.right_panel_width}px"
+
+    @rx.var
+    def chat_panel_open(self) -> bool:
+        return self.right_open and self.right_tab == "chat"
+
+    @rx.var
+    def right_panel_open(self) -> bool:
+        return self.right_open
+
+    def set_right_panel_width(self, width: str):
+        try:
+            value = int(float(width))
+        except (TypeError, ValueError):
+            return
+        self.right_panel_width = max(280, min(720, value))
+
+    def _selected_pdf_file(self) -> Path | None:
+        if not self.selected_pdf_path:
+            return None
+        direct = Path(self.selected_pdf_path)
+        if direct.is_absolute() and direct.exists():
+            return direct
+        safe = self._safe_pdf_path(self.selected_pdf_path)
+        if safe is not None and safe.exists():
+            return safe
+        return None
+
+    def _chat_pdf_path(self) -> str:
+        pdf_path = self._selected_pdf_file()
+        return str(pdf_path) if pdf_path else ""
+
+    def _format_error(self, exc: Exception) -> str:
+        detail = str(exc).strip() or repr(exc)
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                body = response.text[:500]
+            except Exception:
+                body = ""
+            status = getattr(response, "status_code", "")
+            if body:
+                return f"{type(exc).__name__} {status}: {body}"
+        return f"{type(exc).__name__}: {detail}"
 
     def load_papers(self):
         """Load paper list from uploaded_files/."""
@@ -469,7 +526,7 @@ class LibraryState(rx.State):
             shutil.move(str(old_path), str(new_path))
             folder = new_path.parent.name
             rel = new_path.resolve().relative_to(UPLOAD_DIR.resolve()).as_posix()
-            was_selected = bool(self.selected_pdf_path) and old_path == Path(self.selected_pdf_path).resolve()
+            was_selected = old_path == self._selected_pdf_file()
             self.cancel_rename_paper()
             self.load_papers()
             if was_selected:
@@ -484,7 +541,7 @@ class LibraryState(rx.State):
         if pdf_path is None or not pdf_path.exists():
             self.file_status = "PDF 不存在。"
             return
-        was_selected = bool(self.selected_pdf_path) and pdf_path == Path(self.selected_pdf_path).resolve()
+        was_selected = pdf_path == self._selected_pdf_file()
         if self._send_to_recycle_bin(pdf_path):
             if was_selected:
                 self.selected_paper = ""
@@ -514,7 +571,8 @@ class LibraryState(rx.State):
         if prefs.get("pref_show_chat_on_open", True):
             self.right_open = True
             self.right_tab = "chat"
-        # Load existing highlights from PDF and send to iframe after it loads
+        # Load existing highlights from PDF into sidebar and send to iframe
+        self._load_annotations_from_pdf()
         return self._load_and_send_highlights()
 
     def _build_engine(self) -> TranslationEngine:
@@ -532,8 +590,8 @@ class LibraryState(rx.State):
             for p in profiles:
                 if p.get("has_api_key"):
                     return build_engine_from_profile(p)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to load engine profiles, using default: {e}")
         return get_default_translation_engine()
 
     def _build_chat_engine(self) -> TranslationEngine:
@@ -568,9 +626,10 @@ class LibraryState(rx.State):
 
     def _get_note_path(self) -> Path | None:
         """Get the note.md path in the same folder as the PDF."""
-        if not self.selected_pdf_path:
+        pdf_path = self._selected_pdf_file()
+        if pdf_path is None:
             return None
-        return Path(self.selected_pdf_path).parent / "note.md"
+        return pdf_path.parent / "note.md"
 
     def _remove_note_entry(self, kind: str, text: str):
         """Remove a matching entry from note.md."""
@@ -627,6 +686,39 @@ class LibraryState(rx.State):
             note_path.write_text(existing + entry, encoding="utf-8")
         except Exception:
             pass
+
+    def _load_annotations_from_pdf(self):
+        """Load existing PDF annotations into the sidebar list."""
+        pdf_path = self._selected_pdf_file()
+        if pdf_path is None:
+            return
+        try:
+            raw = read_highlights(str(pdf_path))
+        except Exception:
+            return
+        kind_map = {
+            "highlight": "高亮",
+            "underline": "下划线",
+            "strikethrough": "删除线",
+            "comment": "批注",
+            "translation": "翻译",
+        }
+        loaded = []
+        for h in raw:
+            ann_type = h.get("_type", "highlight")
+            text = h.get("content", {}).get("text", "")
+            comment = h.get("comment", {})
+            note = comment.get("text", "") if isinstance(comment, dict) else ""
+            trans = comment.get("translation", "") if isinstance(comment, dict) else ""
+            loaded.append({
+                "id": h.get("id", ""),
+                "kind": "批注" if ann_type == "highlight" and note else kind_map.get(ann_type, "高亮"),
+                "text": text or trans,
+                "note": note,
+                "color": h.get("_color", ""),
+                "annotation_type": ann_type,
+            })
+        self.annotations = loaded
 
     def _load_and_send_highlights(self, delay_ms: int = 1500):
         """Read highlights from PDF and send to iframe without reloading it."""
@@ -932,11 +1024,20 @@ class LibraryState(rx.State):
             self._append_note("笔记", self.selected_text, note_content)
         self.note_text = ""
 
-    def set_chat_scope(self, scope: str):
-        self.chat_scope = scope
-
     def clear_chat(self):
         self.chat_messages = []
+
+    def _attach_explanation_to_chat(self, text: str, result: str, image_data: str = ""):
+        """Add a floating explanation to the Q&A thread so follow-up questions keep context."""
+        quote = (text or "").strip() or ("框选图片区域" if image_data else "选中文本")
+        prompt = "解释框选图片区域" if image_data else "解释选中文本"
+        self.chat_messages = [
+            *self.chat_messages,
+            {"role": "user", "content": prompt, "quote": quote},
+            {"role": "assistant", "content": result, "quote": ""},
+        ]
+        self.right_open = True
+        self.right_tab = "chat"
 
     def handle_page_changed(self, page: int):
         self.selected_page = page
@@ -959,20 +1060,21 @@ class LibraryState(rx.State):
             nearby = ""
             full_text = ""
             loop = asyncio.get_event_loop()
-            if self.selected_pdf_path:
+            pdf_path = self._chat_pdf_path()
+            if pdf_path:
                 full_text = await loop.run_in_executor(
-                    None, extract_full_text, self.selected_pdf_path
+                    None, extract_full_text, pdf_path
                 )
                 if sel_text:
                     nearby = await loop.run_in_executor(
                         None, extract_nearby_text,
-                        self.selected_pdf_path, page_num, sel_text,
+                        pdf_path, page_num, sel_text,
                     )
 
             engine = self._build_chat_engine()
             messages = build_chat_messages(
                 user_query=user_msg,
-                scope=self.chat_scope,
+                scope="paper",
                 paper_title=self.selected_paper,
                 selected_text=sel_text,
                 nearby_text=nearby,
@@ -1001,6 +1103,7 @@ class LibraryState(rx.State):
         async for _ in self.send_chat():
             pass
 
+    @rx.event(background=True)
     async def handle_explain_request(
         self,
         id: str,
@@ -1008,6 +1111,7 @@ class LibraryState(rx.State):
         image: str = "",
         rects: str = "",
         page: int = 0,
+        mode: str = "floating",
     ):
         """Explain selected text or an area selection in a floating PDF popup."""
         if not id:
@@ -1015,12 +1119,28 @@ class LibraryState(rx.State):
 
         selected = (text or "").strip()
         image_data = (image or "").strip()
-        self.selected_text = selected
-        self.translation_rects = rects
-        self.translation_page = page
+        send_to_sidebar = mode == "sidebar"
+        quote = selected or ("框选图片区域" if image_data else "")
+        async with self:
+            self.selected_text = quote
+            self.translation_rects = rects
+            self.translation_page = page
+            engine = self._build_chat_engine()
+        yield
+
+        if send_to_sidebar:
+            async with self:
+                self.right_open = True
+                self.right_tab = "chat"
+                self.chat_input = ""
+                self.chat_loading = True
+                self.chat_messages = [
+                    *self.chat_messages,
+                    {"role": "user", "content": "解释", "quote": quote},
+                ]
+            yield
 
         try:
-            engine = self._build_chat_engine()
             if image_data:
                 if not self._chat_engine_supports_vision(engine):
                     result = (
@@ -1028,25 +1148,31 @@ class LibraryState(rx.State):
                         "请切换到 Kimi、GPT-4o、Qwen-VL、GLM-4V 等视觉模型，"
                         "或直接选中文字后再点解释。"
                     )
-                    return rx.call_script(
-                        f"""(function() {{
-                          var iframe = document.querySelector('iframe[src*="pdf-reader"]');
-                          if (iframe && iframe.contentWindow) {{
-                            iframe.contentWindow.postMessage({{type: 'EXPLAIN_RESULT', id: {json.dumps(id)}, explanation: {json.dumps(result)}}}, window.location.origin);
-                          }}
-                        }})()"""
-                    )
+                    if send_to_sidebar:
+                        async with self:
+                            self.chat_messages = [
+                                *self.chat_messages,
+                                {"role": "assistant", "content": result, "quote": ""},
+                            ]
+                            self.chat_loading = False
+                    else:
+                        yield rx.call_script(
+                            f"""(function() {{
+                              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+                              if (iframe && iframe.contentWindow) {{
+                                iframe.contentWindow.postMessage({{type: 'EXPLAIN_RESULT', id: {json.dumps(id)}, explanation: {json.dumps(result)}}}, window.location.origin);
+                              }}
+                            }})()"""
+                        )
+                    return
                 system = (
-                    "你是学术论文阅读助手。请解释用户框选的论文图片、公式或表格区域。"
-                    "回答要聚焦框选区域，不要泛泛总结整篇论文。"
-                    "请用中文简洁回答，控制在 5 条以内。"
+                    "你是学术论文阅读助手。请自然解释用户框选的论文图片、公式、表格或图示。"
+                    "重点围绕框选区域本身，说明它在表达什么、各部分之间是什么关系。"
+                    "不要复述任务，不要写分析过程，不要泛泛扩展到整篇论文。"
+                    "如果局部看不清，就只解释看得清的部分。"
                 )
                 prompt = (
-                    "请简洁解释这块框选区域。"
-                    "如果是公式，请说明符号含义和推导直觉；"
-                    "如果是图表，请说明变量、趋势和作者想表达的结论；"
-                    "如果是表格，请说明主要比较项和关键结论。"
-                    "不要输出长篇背景介绍，不要使用 Markdown 标题。"
+                    "解释这块框选区域。根据内容自然组织回答；需要展开就展开，需要简短就简短。"
                 )
                 messages: list[dict] = [
                     {"role": "system", "content": system},
@@ -1059,33 +1185,65 @@ class LibraryState(rx.State):
                     },
                 ]
             else:
-                system = (
-                    "你是学术论文阅读助手。请解释用户选中的论文文字。"
-                    "只围绕这段选中文本解释，不要翻译全文，不要扩展到整篇论文。"
-                    "请用中文简洁回答，控制在 3 到 5 条以内。"
-                )
-                prompt = (
-                    "请简洁解释下面这段论文内容：核心意思是什么、关键术语是什么意思。"
-                    "不要使用 Markdown 标题，不要写长篇背景。\n\n"
-                    f"{selected}"
-                )
-                messages = [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ]
+                if send_to_sidebar:
+                    page_num = page or self.selected_page
+                    nearby = ""
+                    full_text = ""
+                    loop = asyncio.get_event_loop()
+                    pdf_path = self._chat_pdf_path()
+                    if pdf_path:
+                        full_text = await loop.run_in_executor(
+                            None, extract_full_text, pdf_path
+                        )
+                        if selected:
+                            nearby = await loop.run_in_executor(
+                                None, extract_nearby_text, pdf_path, page_num, selected
+                            )
+                    messages = build_chat_messages(
+                        user_query="解释",
+                        scope="paper",
+                        paper_title=self.selected_paper,
+                        selected_text=selected,
+                        nearby_text=nearby,
+                        full_text=full_text,
+                        annotations=self.annotations,
+                        chat_history=self.chat_messages[:-1],
+                    )
+                else:
+                    system = (
+                        "你是学术论文阅读助手。请自然解释用户选中的论文文字。"
+                        "只围绕选中文本本身，说明核心意思、关键术语和它在论证中的作用。"
+                        "不要复述任务，不要写分析过程，不要翻译全文，不要泛泛扩展到整篇论文。"
+                    )
+                    prompt = (
+                        "解释下面这段论文内容。根据内容自然组织回答；需要展开就展开，需要简短就简短。\n\n"
+                        f"{selected}"
+                    )
+                    messages = [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ]
 
-            result = await chat_with_context(messages, engine, max_tokens=700 if image_data else 450)
+            result = await chat_with_context(messages, engine, max_tokens=4000)
         except Exception as exc:
-            result = f"解释失败：{exc}"
+            result = f"解释失败：{self._format_error(exc)}"
 
-        return rx.call_script(
-            f"""(function() {{
-              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
-              if (iframe && iframe.contentWindow) {{
-                iframe.contentWindow.postMessage({{type: 'EXPLAIN_RESULT', id: {json.dumps(id)}, explanation: {json.dumps(result)}}}, window.location.origin);
-              }}
-            }})()"""
-        )
+        if send_to_sidebar:
+            async with self:
+                self.chat_messages = [
+                    *self.chat_messages,
+                    {"role": "assistant", "content": result, "quote": ""},
+                ]
+                self.chat_loading = False
+        else:
+            yield rx.call_script(
+                f"""(function() {{
+                  var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+                  if (iframe && iframe.contentWindow) {{
+                    iframe.contentWindow.postMessage({{type: 'EXPLAIN_RESULT', id: {json.dumps(id)}, explanation: {json.dumps(result)}}}, window.location.origin);
+                  }}
+                }})()"""
+            )
 
     # --- Text selection from react-pdf-highlighter ---
 
@@ -1151,7 +1309,8 @@ class LibraryState(rx.State):
         self.annotations = [anno] + list(self.annotations)
         self._append_note(kind, text)
         # Write to PDF file
-        if self.selected_pdf_path and rects and page:
+        pdf_path = self._selected_pdf_file()
+        if pdf_path and rects and page:
             try:
                 parsed_rects = json.loads(rects)
                 # Rects from react-pdf-highlighter are in rendered page coordinates.
@@ -1170,7 +1329,7 @@ class LibraryState(rx.State):
 
                 if annotation_type == "underline":
                     add_underline(
-                        self.selected_pdf_path,
+                        str(pdf_path),
                         page_num=page,
                         rects=converted,
                         color_hex=color,
@@ -1179,7 +1338,7 @@ class LibraryState(rx.State):
                     )
                 elif annotation_type == "strikethrough":
                     add_strikethrough(
-                        self.selected_pdf_path,
+                        str(pdf_path),
                         page_num=page,
                         rects=converted,
                         color_hex=color,
@@ -1188,30 +1347,27 @@ class LibraryState(rx.State):
                     )
                 else:
                     add_highlight(
-                        self.selected_pdf_path,
+                        str(pdf_path),
                         page_num=page,
                         rects=converted,
                         color_hex=color,
                         highlight_id=annotation_id,
                         text=text,
                     )
-            except Exception:
-                pass  # Don't crash on write failure
+            except Exception as e:
+                logger.warning(f"Failed to write highlight to PDF: {e}")
         return self._load_and_send_highlights(delay_ms=250)
 
     def handle_highlight_deleted(self, id: str):
         """Handle a highlight deleted in the PDF reader."""
         self.annotations = [a for a in self.annotations if a.get("id") != id]
-        # Delete from PDF file
-        if self.selected_pdf_path and id:
+        # Delete from PDF file — single annotation per id
+        pdf_path = self._selected_pdf_file()
+        if pdf_path and id:
             try:
-                delete_highlight(self.selected_pdf_path, id)
-                if id.startswith("trans-"):
-                    delete_highlight(self.selected_pdf_path, "trans-source-" + id[len("trans-"):])
-                if id.startswith("note-"):
-                    delete_highlight(self.selected_pdf_path, id[len("note-"):])
-            except Exception:
-                pass
+                delete_highlight(str(pdf_path), id)
+            except Exception as e:
+                logger.warning(f"Failed to delete highlight from PDF: {e}")
 
     def delete_annotation(self, id: str):
         """Delete an annotation from the right panel — also removes from PDF, note.md, and iframe."""
@@ -1220,16 +1376,72 @@ class LibraryState(rx.State):
         if target:
             self._remove_note_entry(target.get("kind", ""), target.get("text", ""))
         self.annotations = [a for a in self.annotations if a.get("id") != id]
-        if self.selected_pdf_path and id:
+        pdf_path = self._selected_pdf_file()
+        if pdf_path and id:
             try:
-                delete_highlight(self.selected_pdf_path, id)
-            except Exception:
-                pass
+                delete_highlight(str(pdf_path), id)
+            except Exception as e:
+                logger.warning(f"Failed to delete annotation from PDF: {e}")
         return rx.call_script(
             f"""(function() {{
               var iframe = document.querySelector('iframe[src*="pdf-reader"]');
               if (iframe && iframe.contentWindow) {{
                 iframe.contentWindow.postMessage({{type: 'REMOVE_HIGHLIGHT', id: {json.dumps(id)}}}, window.location.origin);
+              }}
+            }})()"""
+        )
+
+    def start_edit_annotation(self, id: str):
+        target = next((a for a in self.annotations if a.get("id") == id), None)
+        if not target:
+            return
+        self.editing_annotation_id = id
+        self.editing_annotation_note = target.get("note", "")
+
+    def set_editing_annotation_note(self, value: str):
+        self.editing_annotation_note = value
+
+    def cancel_edit_annotation(self):
+        self.editing_annotation_id = ""
+        self.editing_annotation_note = ""
+
+    def save_annotation_edit(self):
+        annot_id = self.editing_annotation_id
+        note = self.editing_annotation_note.strip()
+        if not annot_id:
+            return
+        target = next((a for a in self.annotations if a.get("id") == annot_id), None)
+        if not target:
+            self.cancel_edit_annotation()
+            return
+
+        old_note = target.get("note", "")
+        self.annotations = [
+            {**a, "note": note} if a.get("id") == annot_id else a
+            for a in self.annotations
+        ]
+
+        pdf_path = self._selected_pdf_file()
+        if pdf_path:
+            try:
+                update_annotation_comment(str(pdf_path), annot_id, note)
+            except Exception as e:
+                logger.warning(f"Failed to update annotation comment in PDF: {e}")
+
+        if old_note != note:
+            self._remove_note_entry(target.get("kind", ""), target.get("text", ""))
+            self._append_note(target.get("kind", "批注"), target.get("text", ""), note)
+
+        self.cancel_edit_annotation()
+        return rx.call_script(
+            f"""(function() {{
+              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+              if (iframe && iframe.contentWindow) {{
+                iframe.contentWindow.postMessage({{
+                  type: 'UPDATE_HIGHLIGHT_COMMENT',
+                  id: {json.dumps(annot_id)},
+                  comment: {json.dumps(note)}
+                }}, window.location.origin);
               }}
             }})()"""
         )
@@ -1312,11 +1524,13 @@ class LibraryState(rx.State):
         # Auto-translate: result stays in sidebar, no floating popup
 
     def handle_save_translation(self, id: str, text: str, translation: str, rects: str = "", page: int = 0):
-        """Save a translation result as a FreeText annotation in the PDF.
+        """Save a translation as a Highlight annotation with translation as content.
 
-        Called when user clicks '保存' in float mode or '批注' in sidebar mode.
+        Writes a single PDF Highlight (no FreeText). Translation is stored in
+        the annotation's content field and shows on hover in any PDF reader.
         """
-        if not translation.strip() or not self.selected_pdf_path:
+        pdf_path = self._selected_pdf_file()
+        if not translation.strip() or not pdf_path:
             return
         try:
             parsed_rects = json.loads(rects) if rects else []
@@ -1326,51 +1540,58 @@ class LibraryState(rx.State):
                 if source_rects:
                     source_page = int(source_rects[0].get("pageNumber") or page)
                     add_highlight(
-                        self.selected_pdf_path,
+                        str(pdf_path),
                         page_num=source_page,
                         rects=source_rects,
                         color_hex="#FFD700",
-                        highlight_id=f"trans-source-{id}",
-                        text=text,
+                        highlight_id=id,
+                        text=translation,
+                        subject="translation",
                     )
-                add_freetext_annot(
-                    self.selected_pdf_path,
-                    page_num=page,
-                    rects=normalized_rects,
-                    translation=translation,
-                    annot_id=f"trans-{id}",
-                )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to save translation to PDF: {e}")
 
         # Add to annotations list
         anno = {
-            "id": id or str(uuid.uuid4())[:8],
+            "id": id,
             "kind": "翻译",
             "text": text[:80],
             "note": translation,
+            "annotation_type": "translation",
         }
         self.annotations = [anno] + list(self.annotations)
         self._append_note("翻译", text[:80], translation)
 
-        return self._load_and_send_highlights(delay_ms=250)
+        # Update the highlight in the iframe without full reload
+        annotation_id = json.dumps(id)
+        trans_json = json.dumps(translation)
+        return rx.call_script(
+            f"""(function() {{
+              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+              if (iframe && iframe.contentWindow) {{
+                iframe.contentWindow.postMessage({{type: 'UPDATE_HIGHLIGHT_COMMENT', id: {annotation_id}, comment: {trans_json}}}, window.location.origin);
+                iframe.contentWindow.postMessage({{type: 'UPDATE_HIGHLIGHT_TYPE', id: {annotation_id}, annotationType: 'translation'}}, window.location.origin);
+              }}
+            }})()"""
+        )
 
     def handle_move_freetext(self, id: str, text: str, rects: str = "", page: int = 0):
         """Move an already written visible translation/comment annotation."""
-        if not id or not text.strip() or not self.selected_pdf_path:
+        pdf_path = self._selected_pdf_file()
+        if not id or not text.strip() or not pdf_path:
             return
         try:
             parsed_rects = self._normalize_reader_rects(json.loads(rects)) if rects else []
             if parsed_rects and page:
                 move_freetext_annot(
-                    self.selected_pdf_path,
+                    str(pdf_path),
                     annot_id=id,
                     page_num=page,
                     rects=parsed_rects,
                     text=text,
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to move freetext annotation: {e}")
         return self._load_and_send_highlights(delay_ms=250)
 
     def pin_translation(self, id: str, text: str, result: str, rects: str = "", page: int = 0):
@@ -1394,23 +1615,16 @@ class LibraryState(rx.State):
         self.right_tab = "translate"
 
     def place_current_translation(self):
-        """Ask the PDF reader to show a draggable placement box for the current translation."""
+        """Save the current sidebar translation to PDF as a highlight annotation."""
         if not self.translation_result.strip():
             return
-        return rx.call_script(
-            f"""(function() {{
-              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
-              if (iframe && iframe.contentWindow) {{
-                iframe.contentWindow.postMessage({{
-                  type: 'START_TRANSLATION_PLACEMENT',
-                  id: {json.dumps(self.current_pinned_id or ('trans-' + str(uuid.uuid4())[:8]))},
-                  text: {json.dumps(self.selected_text)},
-                  translation: {json.dumps(self.translation_result)},
-                  rects: {self.translation_rects or '[]'},
-                  page: {self.translation_page or 0}
-                }}, window.location.origin);
-              }}
-            }})()"""
+        annotation_id = self.current_pinned_id or str(uuid.uuid4())[:8]
+        return self.handle_save_translation(
+            id=annotation_id,
+            text=self.selected_text,
+            translation=self.translation_result,
+            rects=self.translation_rects or "[]",
+            page=self.translation_page or 0,
         )
 
     def unpin_translation(self, id: str):
@@ -1476,28 +1690,22 @@ class LibraryState(rx.State):
         }
         self.annotations = [anno] + list(self.annotations)
         self._append_note("批注", text, comment)
-        # Write visible PDF annotations so notes are readable without hover.
-        if self.selected_pdf_path and rects and page:
+        # Store the user's note on the PDF highlight itself so PDF readers show it on hover.
+        pdf_path = self._selected_pdf_file()
+        if pdf_path and rects and page:
             try:
                 parsed_rects = self._normalize_reader_rects(json.loads(rects))
                 source_page = int(parsed_rects[0].get("pageNumber") or page)
                 add_highlight(
-                    self.selected_pdf_path,
+                    str(pdf_path),
                     page_num=source_page,
                     rects=parsed_rects,
                     color_hex="#FFD700",
                     highlight_id=id,
-                    text=text,
+                    text=comment,
                 )
-                add_freetext_annot(
-                    self.selected_pdf_path,
-                    page_num=page,
-                    rects=parsed_rects,
-                    translation=comment,
-                    annot_id=f"note-{id}",
-                )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to add annotation to PDF: {e}")
         return self._load_and_send_highlights(delay_ms=250)
 
     async def translate_selection(self):

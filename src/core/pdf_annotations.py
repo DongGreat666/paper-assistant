@@ -9,7 +9,9 @@ concurrent saveIncr() calls from corrupting the PDF.
 """
 
 import logging
+import re
 import threading
+import weakref
 from contextlib import contextmanager
 
 import fitz  # PyMuPDF
@@ -17,16 +19,111 @@ import fitz  # PyMuPDF
 logger = logging.getLogger(__name__)
 
 # Per-file locks — prevents concurrent writes to the same PDF
-_pdf_locks: dict[str, threading.Lock] = {}
+# Uses WeakValueDictionary to auto-cleanup locks when no longer referenced
+_pdf_locks: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 _locks_lock = threading.Lock()
 
 
 def _get_pdf_lock(path: str) -> threading.Lock:
+    """Get or create a lock for the given PDF path.
+
+    Uses WeakValueDictionary so locks are automatically cleaned up
+    when no longer in use, preventing memory leaks.
+    """
     key = str(path)
     with _locks_lock:
-        if key not in _pdf_locks:
-            _pdf_locks[key] = threading.Lock()
-        return _pdf_locks[key]
+        lock = _pdf_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _pdf_locks[key] = lock
+        return lock
+
+
+def _cleanup_pdf_lock(path: str) -> None:
+    """Explicitly remove a lock for the given PDF path.
+
+    Call this when a PDF is deleted or no longer needs locking.
+    """
+    key = str(path)
+    with _locks_lock:
+        _pdf_locks.pop(key, None)
+
+
+def _clean_annotation_text(text: str) -> str:
+    """Normalize text read back from PDF annotations for sidebar display."""
+    if not text:
+        return ""
+    text = text.replace("\u00ad", "")
+    text = re.sub(r"(?<=[A-Za-z0-9,.;:!?%])-\s*\n\s*(?=[A-Za-z])", "", text)
+    text = re.sub(r"\s*\n\s*", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _same_annotation_text(a: str, b: str) -> bool:
+    """Return true when PDF annotation content is just another copy of selected text."""
+    a_norm = _clean_annotation_text(a)
+    b_norm = _clean_annotation_text(b)
+    if not a_norm or not b_norm:
+        return False
+    if a_norm == b_norm:
+        return True
+    compact_a = re.sub(r"\W+", "", a_norm.casefold())
+    compact_b = re.sub(r"\W+", "", b_norm.casefold())
+    return bool(compact_a and compact_b and compact_a == compact_b)
+
+
+def _text_from_annotation_words(page, annot) -> str:
+    """Rebuild annotation text from PDF words inside the annotation quads."""
+    try:
+        words = page.get_text("words")
+    except Exception:
+        return ""
+    if not words:
+        return ""
+
+    vertices = getattr(annot, "vertices", None) or []
+    quad_rects = []
+    for i in range(0, len(vertices), 4):
+        quad = vertices[i:i + 4]
+        if len(quad) != 4:
+            continue
+        xs = [p[0] for p in quad]
+        ys = [p[1] for p in quad]
+        rect = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+        rect.x0 -= 1
+        rect.x1 += 1
+        rect.y0 -= 1
+        rect.y1 += 1
+        quad_rects.append(rect)
+    if not quad_rects:
+        quad_rects = [annot.rect]
+
+    selected: list[tuple[float, float, float, str]] = []
+    seen: set[tuple[float, float, float, float, str]] = set()
+    for rect in quad_rects:
+        line_words = []
+        for word in words:
+            x0, y0, x1, y1, value = word[:5]
+            word_rect = fitz.Rect(x0, y0, x1, y1)
+            if not rect.intersects(word_rect):
+                continue
+            key = (round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2), value)
+            if key in seen:
+                continue
+            seen.add(key)
+            line_words.append((x0, y0, x1, value))
+        selected.extend(sorted(line_words, key=lambda item: (item[1], item[0])))
+
+    lines: list[list[tuple[float, float, float, str]]] = []
+    for item in sorted(selected, key=lambda item: (item[1], item[0])):
+        if not lines or abs(lines[-1][0][1] - item[1]) > 3:
+            lines.append([item])
+        else:
+            lines[-1].append(item)
+
+    parts = [" ".join(word for *_coords, word in sorted(line, key=lambda item: item[0])) for line in lines]
+    return _clean_annotation_text("\n".join(parts))
 
 
 @contextmanager
@@ -88,7 +185,7 @@ def read_highlights(pdf_path: str) -> list[dict]:
 
                     annot_id = annot.info.get("title", "") or f"ann-{page_num}-{annot.xref}"
                     info = annot.info or {}
-                    comment_text = info.get("content", "") or ""
+                    comment_text = _clean_annotation_text(info.get("content", "") or "")
 
                     # Text annotation (sticky note)
                     if atype == 0:
@@ -120,7 +217,7 @@ def read_highlights(pdf_path: str) -> list[dict]:
                     if atype == 2:
                         text_content = ""
                         try:
-                            text_content = annot.get_text("text").strip()
+                            text_content = _clean_annotation_text(annot.get_text("text"))
                         except Exception:
                             logger.debug("Failed to extract FreeText content, falling back to comment")
                             text_content = comment_text
@@ -157,13 +254,24 @@ def read_highlights(pdf_path: str) -> list[dict]:
                         int(stroke_color[2] * 255),
                     )
 
-                    text = ""
+                    text = _text_from_annotation_words(page, annot)
                     try:
-                        text = annot.get_text("text").strip()
+                        if not text:
+                            text = _clean_annotation_text(annot.get_text("text"))
                     except Exception:
                         logger.debug("Failed to extract text from annotation xref=%d", annot.xref)
+                    note_text = comment_text if comment_text and not _same_annotation_text(comment_text, text) else ""
 
-                    ann_type = "underline" if atype == 9 else "strikethrough" if atype == 10 else "highlight"
+                    # Detect annotation type: check subject field first, then fallback to PDF type
+                    subject = info.get("subject", "") or ""
+                    if subject == "translation" or annot_id.startswith("trans-"):
+                        ann_type = "translation"
+                    elif atype == 9:
+                        ann_type = "underline"
+                    elif atype == 10:
+                        ann_type = "strikethrough"
+                    else:
+                        ann_type = "highlight"
 
                     highlights.append({
                         "id": annot_id,
@@ -183,7 +291,7 @@ def read_highlights(pdf_path: str) -> list[dict]:
                             "pageNumber": page_num + 1,
                         },
                         "content": {"text": text},
-                        "comment": {"text": "", "emoji": ""},
+                        "comment": {"text": note_text, "emoji": ""},
                         "_color": color_hex,
                         "_type": ann_type,
                     })
@@ -274,6 +382,20 @@ def _merge_rects_by_line(rects: list[dict]) -> list[dict]:
     return merged
 
 
+def _line_rects_for_text_marks(rects: list[dict]) -> list[dict]:
+    """Build tighter line rects for underline/strikeout annotations."""
+    merged = _merge_rects_by_line(rects)
+    adjusted: list[dict] = []
+    for rect in merged:
+        height = max(rect["y2"] - rect["y1"], 0.0001)
+        adjusted.append({
+            **rect,
+            "y1": rect["y2"] - height * 0.72,
+            "y2": rect["y2"] + height * 0.08,
+        })
+    return adjusted
+
+
 def _save(doc, pdf_path: str):
     """Save PDF incrementally."""
     try:
@@ -296,6 +418,7 @@ def add_highlight(
     color_hex: str = "#FFD700",
     highlight_id: str = "",
     text: str = "",
+    subject: str = "",
 ) -> bool:
     """Add a real PDF Highlight annotation."""
     with _open_pdf_for_write(pdf_path) as doc:
@@ -307,7 +430,10 @@ def add_highlight(
         annot = page.add_highlight_annot(quads)
         annot.set_colors(stroke=(r, g, b))
         annot.set_opacity(0.4)
-        annot.set_info(title=highlight_id, content=text)
+        info = {"title": highlight_id, "content": text}
+        if subject:
+            info["subject"] = subject
+        annot.set_info(info)
         annot.update()
         _save(doc, pdf_path)
     return True
@@ -327,7 +453,7 @@ def add_underline(
             return False
         page = doc[page_num - 1]
         r, g, b = _parse_color(color_hex)
-        quads = _convert_rects(_merge_rects_by_line(rects), page)
+        quads = _convert_rects(_line_rects_for_text_marks(rects), page)
         annot = page.add_underline_annot(quads)
         annot.set_colors(stroke=(r, g, b))
         annot.set_info(title=highlight_id, content=text)
@@ -350,7 +476,7 @@ def add_strikethrough(
             return False
         page = doc[page_num - 1]
         r, g, b = _parse_color(color_hex)
-        quads = _convert_rects(_merge_rects_by_line(rects), page)
+        quads = _convert_rects(_line_rects_for_text_marks(rects), page)
         annot = page.add_strikeout_annot(quads)
         annot.set_colors(stroke=(r, g, b))
         annot.set_info(title=highlight_id, content=text)
@@ -374,6 +500,27 @@ def delete_highlight(pdf_path: str, highlight_id: str) -> bool:
         if deleted:
             _save(doc, pdf_path)
     return deleted
+
+
+def update_annotation_comment(pdf_path: str, annot_id: str, comment: str) -> bool:
+    """Update the stored popup/comment text on an existing PDF annotation."""
+    if not annot_id:
+        return False
+    with _open_pdf_for_write(pdf_path) as doc:
+        updated = False
+        for page in doc:
+            for annot in page.annots():
+                if annot.info.get("title", "") != annot_id:
+                    continue
+                annot.set_info(content=comment)
+                annot.update()
+                updated = True
+                break
+            if updated:
+                break
+        if updated:
+            _save(doc, pdf_path)
+    return updated
 
 
 def add_text_annot(

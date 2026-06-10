@@ -11,6 +11,7 @@ from urllib.parse import unquote, urlparse
 import reflex as rx
 
 from src.core.document_parser import (
+    check_available_memory,
     parse_pdf_to_markdown,
     save_markdown,
     unload_marker_models,
@@ -22,15 +23,20 @@ from src.core.engine import (
     has_usable_api_key,
     load_engine_profiles,
 )
-from src.core.exporter import make_reading_markdown, markdown_to_pdf
+from src.core.exporter import (
+    format_markdown_for_display,
+    make_compact_markdown,
+    markdown_to_pdf,
+    repair_markdown_code_fences,
+)
+from src.core.markdown_repair import RepairReport, repair_heading_levels, repair_marker_markdown
 from src.core.translator import (
     markdown_to_html,
-    merge_bilingual,
     split_markdown_into_sections,
     translate_markdown,
 )
-from scripts.fix_md_refs import fix_markdown
 from src.ui.components.layout import app_shell, page_header, panel, small_label
+from config import read_settings, write_settings
 from src.ui.pages.home_model_service import (
     delete_engine_action,
     save_engine_action,
@@ -62,6 +68,38 @@ def _cancel_task(token: str):
 
 def _is_cancelled(token: str) -> bool:
     return _task_cancels.get(token, [True])[0]
+
+
+def _translate_defaults() -> dict:
+    """Load persisted translate engine settings."""
+    settings = read_settings()
+    return {
+        "selected_engine_id": settings.get("translate_selected_engine_id", "env-default"),
+        "engine_api_key": settings.get("translate_engine_api_key", ""),
+        "engine_base_url": settings.get("translate_engine_base_url", get_default_translation_engine().base_url),
+        "engine_model": settings.get("translate_engine_model", get_default_translation_engine().model),
+        "engine_temperature": settings.get("translate_engine_temperature", str(get_default_translation_engine().temperature)),
+        "engine_name": settings.get("translate_engine_name", "DeepSeek 翻译"),
+    }
+
+
+def _persist_translate_engine(
+    selected_engine_id: str,
+    engine_api_key: str,
+    engine_base_url: str,
+    engine_model: str,
+    engine_temperature: str,
+    engine_name: str,
+) -> None:
+    """Persist translate engine selection to settings file."""
+    write_settings({
+        "translate_selected_engine_id": selected_engine_id,
+        "translate_engine_api_key": engine_api_key,
+        "translate_engine_base_url": engine_base_url,
+        "translate_engine_model": engine_model,
+        "translate_engine_temperature": engine_temperature,
+        "translate_engine_name": engine_name,
+    })
 
 
 def _missing_markdown_images(md_text: str, folder: Path) -> list[str]:
@@ -103,17 +141,29 @@ class TranslateState(rx.State):
     recent_logs: list[str] = []
     show_logs: bool = False
     file_info: str = ""
-    bilingual_md: str = ""
     current_task_token: str = ""
 
-    # Engine config form fields
+    @rx.var
+    def preview_pairs(self) -> list[dict[str, str]]:
+        original_sections = split_markdown_into_sections(self.original_md) if self.original_md else []
+        translated_sections = split_markdown_into_sections(self.translated_md) if self.translated_md else []
+        total = max(len(original_sections), len(translated_sections))
+        return [
+            {
+                "original": format_markdown_for_display(original_sections[i]) if i < len(original_sections) else "",
+                "translated": format_markdown_for_display(translated_sections[i]) if i < len(translated_sections) else "",
+            }
+            for i in range(total)
+        ]
+
+    # Engine config form fields — initialized from persisted settings
     model_auto: bool = False
-    engine_api_key: str = ""
-    engine_base_url: str = get_default_translation_engine().base_url
-    engine_model: str = get_default_translation_engine().model
-    engine_temperature: str = str(get_default_translation_engine().temperature)
-    engine_name: str = "DeepSeek 翻译"
-    selected_engine_id: str = "env-default"
+    engine_api_key: str = _translate_defaults()["engine_api_key"]
+    engine_base_url: str = _translate_defaults()["engine_base_url"]
+    engine_model: str = _translate_defaults()["engine_model"]
+    engine_temperature: str = _translate_defaults()["engine_temperature"]
+    engine_name: str = _translate_defaults()["engine_name"]
+    selected_engine_id: str = _translate_defaults()["selected_engine_id"]
     saved_engines: list[dict] = load_engine_profiles()
     show_engine_config: bool = False
 
@@ -146,11 +196,23 @@ class TranslateState(rx.State):
 
     # --- Engine CRUD ---
 
+    def _persist_current_engine(self):
+        """Save current engine selection to disk."""
+        _persist_translate_engine(
+            selected_engine_id=self.selected_engine_id,
+            engine_api_key=self.engine_api_key,
+            engine_base_url=self.engine_base_url,
+            engine_model=self.engine_model,
+            engine_temperature=self.engine_temperature,
+            engine_name=self.engine_name,
+        )
+
     def select_engine(self, profile_id: str):
         updates = select_engine_action(self.saved_engines, profile_id)
         if updates:
             for k, v in updates.items():
                 setattr(self, k, v)
+            self._persist_current_engine()
 
     def start_edit_engine(self, profile_id: str):
         self.show_engine_config = True
@@ -185,6 +247,7 @@ class TranslateState(rx.State):
         self.selected_engine_id = pid
         self.editing_engine_id = ""
         self.status_message = f"已保存翻译引擎：{self.engine_name.strip() or '翻译引擎'}。"
+        self._persist_current_engine()
 
     def delete_engine(self, profile_id: str):
         self.saved_engines = delete_engine_action(self.saved_engines, profile_id)
@@ -193,6 +256,7 @@ class TranslateState(rx.State):
         if self.editing_engine_id == profile_id:
             self.editing_engine_id = ""
         self.status_message = "已删除翻译引擎。"
+        self._persist_current_engine()
 
     async def test_engine(self, profile_id: str):
         profile = next((p for p in self.saved_engines if p.get("id") == profile_id), None)
@@ -247,7 +311,6 @@ class TranslateState(rx.State):
         self.file_info = saved.file_info
         self.translated_md = ""
         self.translated_html = ""
-        self.bilingual_md = ""
         self.progress_step = 0
         self.logs = []
 
@@ -258,17 +321,13 @@ class TranslateState(rx.State):
 
         if saved.suffix == ".md":
             md_text = saved.data.decode("utf-8")
-            raw_path = saved.folder / f"{saved.stem}_raw.md"
-            raw_path.write_text(md_text, encoding="utf-8")
-            loop = asyncio.get_event_loop()
-            fixed = await loop.run_in_executor(None, fix_markdown, md_text)
             fixed_path = saved.folder / f"{saved.stem}.md"
-            fixed_path.write_text(fixed, encoding="utf-8")
-            self.original_md = fixed
-            self.original_html = markdown_to_html(fixed)
+            fixed_path.write_text(md_text, encoding="utf-8")
+            self.original_md = md_text
+            self.original_html = markdown_to_html(md_text)
             self.translated_html = ""
             self.progress_step = 2
-            self._log(f"已上传并修正：{saved.safe_name}")
+            self._log(f"已上传：{saved.safe_name}")
             self.status_message = "点击「翻译」开始翻译。"
         else:
             self.original_md = ""
@@ -293,20 +352,16 @@ class TranslateState(rx.State):
         # Fast path: .md file — no heavy work, lock only for state writes
         if Path(saved_path).suffix.lower() == ".md":
             raw_md = Path(saved_path).read_text(encoding="utf-8")
-            raw_path = folder / f"{stem}_raw.md"
-            if not raw_path.exists():
-                raw_path.write_text(raw_md, encoding="utf-8")
-            fixed = fix_markdown(raw_md)
             fixed_path = folder / f"{stem}.md"
-            fixed_path.write_text(fixed, encoding="utf-8")
-            html = markdown_to_html(fixed)
+            fixed_path.write_text(raw_md, encoding="utf-8")
+            html = markdown_to_html(raw_md)
             async with self:
-                self.original_md = fixed
+                self.original_md = raw_md
                 self.original_html = html
                 self.translated_md = ""
                 self.translated_html = ""
                 self.progress_step = 2
-                self._log("Markdown 已修正")
+                self._log("Markdown 已加载")
                 self.status_message = "点击「翻译」开始翻译。"
             return
 
@@ -316,12 +371,9 @@ class TranslateState(rx.State):
             cached_md = md_path.read_text(encoding="utf-8")
             missing_imgs = _missing_markdown_images(cached_md, folder)
             if not missing_imgs:
-                fixed = fix_markdown(cached_md)
-                if fixed != cached_md:
-                    md_path.write_text(fixed, encoding="utf-8")
-                html = markdown_to_html(fixed)
+                html = markdown_to_html(cached_md)
                 async with self:
-                    self.original_md = fixed
+                    self.original_md = cached_md
                     self.original_html = html
                     self.translated_md = ""
                     self.translated_html = ""
@@ -342,14 +394,49 @@ class TranslateState(rx.State):
 
             loop = asyncio.get_event_loop()
 
+            # Pre-check available memory before loading heavy ML models
+            mem_ok, avail_mb = check_available_memory()
+            if not mem_ok:
+                async with self:
+                    self._log(f"可用内存不足：当前 {avail_mb}MB，需要至少 6000MB。")
+                    self.status_message = (
+                        f"可用内存不足（{avail_mb}MB / 需 6GB）。"
+                        "请关闭一些应用后重试。"
+                    )
+                    self.is_parsing = False
+                return
+
             async with self:
                 self._log("正在调用 Marker 模型...")
             yield
 
-            # Heavy ML work — runs outside the state lock
-            md_text, images = await loop.run_in_executor(
-                None, parse_pdf_to_markdown, saved_path
-            )
+            # Marker does not expose fine-grained progress here; this is only an
+            # elapsed-time notice so the UI does not look frozen.
+            elapsed = 0
+            async def _heartbeat():
+                nonlocal elapsed
+                while True:
+                    await asyncio.sleep(15)
+                    elapsed += 15
+                    mins, secs = divmod(elapsed, 60)
+                    async with self:
+                        self._log(f"仍在等待 Marker 返回... 已用时 {mins} 分 {secs} 秒")
+                        self.status_message = f"Marker 正在解析 PDF，已用时 {mins} 分 {secs} 秒。"
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
+
+            # Heavy ML work — runs outside the state lock (subprocess-isolated)
+            try:
+                md_text, images = await loop.run_in_executor(
+                    None, parse_pdf_to_markdown, saved_path
+                )
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
             unload_marker_models()
 
             if _is_cancelled(token) or self.stop_requested:
@@ -378,20 +465,13 @@ class TranslateState(rx.State):
             yield
 
             await loop.run_in_executor(None, save_markdown, md_text, saved_path, images)
-            raw_path = folder / f"{stem}_raw.md"
-            raw_path.write_text(md_text, encoding="utf-8")
 
-            async with self:
-                self._log("正在修正引用链接...")
-            yield
-
-            fixed = fix_markdown(md_text)
             md_path = folder / f"{stem}.md"
-            md_path.write_text(fixed, encoding="utf-8")
-            html = markdown_to_html(fixed)
+            md_path.write_text(md_text, encoding="utf-8")
+            html = markdown_to_html(md_text)
 
             async with self:
-                self.original_md = fixed
+                self.original_md = md_text
                 self.original_html = html
                 self.translated_md = ""
                 self.translated_html = ""
@@ -399,6 +479,7 @@ class TranslateState(rx.State):
                 self._log("解析完成")
                 self.status_message = "点击「翻译」开始翻译。"
         except Exception as exc:
+            unload_marker_models()  # Free ~3GB RAM on any failure
             async with self:
                 self._log(f"解析失败：{exc}")
                 self.status_message = f"解析失败：{exc}"
@@ -431,11 +512,10 @@ class TranslateState(rx.State):
         # Cached translation
         zh_path = Path(folder_path) / f"{stem}_zh.md"
         if zh_path.exists() and not translated_md:
-            raw_zh = zh_path.read_text(encoding="utf-8")
-            result_fixed = fix_markdown(raw_zh)
-            html = markdown_to_html(result_fixed)
+            result = zh_path.read_text(encoding="utf-8")
+            html = markdown_to_html(result)
             async with self:
-                self.translated_md = result_fixed
+                self.translated_md = result
                 self.translated_html = html
                 self.progress_step = 3
                 self.status_message = "已加载译文。可以下载或打开文件夹。"
@@ -459,6 +539,24 @@ class TranslateState(rx.State):
                 self.current_task_token = token
                 self.stop_requested = False
                 self.is_translating = True
+                self._log("正在修正标题层级...")
+                self.status_message = "正在修正 Markdown 标题层级..."
+            yield
+
+            repaired_md, repair_report = repair_marker_markdown(original_md)
+            original_md = repaired_md
+            if folder_path:
+                md_path = Path(folder_path) / f"{stem}.md"
+                md_path.write_text(repaired_md, encoding="utf-8")
+
+            repair_changes = repair_report.headings_fixed
+            async with self:
+                self.original_md = repaired_md
+                self.original_html = markdown_to_html(repaired_md)
+                if repair_changes:
+                    self._log(f"标题层级修正完成：{repair_report.headings_fixed} 处")
+                else:
+                    self._log("修正完成：未发现需要处理的问题")
                 self._log("开始翻译...")
                 self.status_message = "正在翻译 Markdown 文档..."
             yield
@@ -468,6 +566,9 @@ class TranslateState(rx.State):
                 original_md, engine=engine, on_progress=on_progress,
                 should_stop=lambda: _is_cancelled(token) or self.stop_requested,
             )
+            result_report = RepairReport()
+            result = repair_markdown_code_fences(result)
+            result = repair_heading_levels(result, result_report)
 
             if _is_cancelled(token) or self.stop_requested:
                 async with self:
@@ -476,10 +577,8 @@ class TranslateState(rx.State):
                     self.is_translating = False
                 return
 
-            result_fixed = fix_markdown(result)
-
             # Check if translation actually produced real content
-            fail_count = result_fixed.count("<!-- 翻译失败") + result_fixed.count("<!-- 翻译超时")
+            fail_count = result.count("<!-- 翻译失败") + result.count("<!-- 翻译超时")
             total_sections = len(split_markdown_into_sections(original_md))
             if fail_count > 0 and fail_count >= total_sections:
                 async with self:
@@ -489,25 +588,18 @@ class TranslateState(rx.State):
                     self.status_message = "翻译失败：所有段落均翻译失败，请检查 API Key 和网络连接。"
                 return
 
-            # Save results to disk (all I/O uses locals, no self)
-            bi_md = ""
+            # Save the translated Markdown only. Reading/bilingual derivatives
+            # were removed because they can drift from the source structure.
             if folder_path:
-                zh_path.write_text(result_fixed, encoding="utf-8")
-                bi_md = merge_bilingual(original_md, result_fixed)
-                bi_path = Path(folder_path) / f"{stem}_bilingual.md"
-                bi_path.write_text(bi_md, encoding="utf-8")
-                reading_path = Path(folder_path) / f"{stem}_reading.md"
-                reading_path.write_text(make_reading_markdown(result_fixed), encoding="utf-8")
+                zh_path.write_text(result, encoding="utf-8")
 
-            html = markdown_to_html(result_fixed)
+            html = markdown_to_html(result)
 
             async with self:
-                self.translated_md = result_fixed
+                self.translated_md = result
                 self.translated_html = html
                 if folder_path:
-                    self.bilingual_md = bi_md
-                    self._log(f"已生成对照文档：{stem}_bilingual.md")
-                    self._log(f"已生成精简正文：{stem}_reading.md")
+                    self._log(f"已生成中文译文：{stem}_zh.md")
                 if fail_count > 0:
                     self._log(f"翻译完成（{fail_count} 个段落失败）")
                     self.status_message = f"翻译完成，但有 {fail_count} 个段落失败。"
@@ -541,41 +633,14 @@ class TranslateState(rx.State):
         folder, stem = self._translation_paths()
         zh_path = folder / f"{stem}_zh.md"
         if zh_path.exists():
-            return fix_markdown(zh_path.read_text(encoding="utf-8"))
+            return zh_path.read_text(encoding="utf-8")
         raise ValueError("请先完成翻译。")
-
-    def _load_original_md(self) -> str:
-        if self.original_md:
-            return self.original_md
-        folder, stem = self._translation_paths()
-        orig_path = folder / f"{stem}.md"
-        if orig_path.exists():
-            return orig_path.read_text(encoding="utf-8")
-        raise ValueError("需要原文 Markdown 才能生成对照版。")
-
-    def _ensure_bilingual_md(self) -> str:
-        folder, stem = self._translation_paths()
-        bi_path = folder / f"{stem}_bilingual.md"
-        if not bi_path.exists():
-            content = merge_bilingual(self._load_original_md(), self._load_translated_md())
-            bi_path.write_text(content, encoding="utf-8")
-            return content
-        return bi_path.read_text(encoding="utf-8")
-
-    def _ensure_reading_md(self) -> str:
-        folder, stem = self._translation_paths()
-        content = make_reading_markdown(self._load_translated_md())
-        reading_path = folder / f"{stem}_reading.md"
-        reading_path.write_text(content, encoding="utf-8")
-        return content
 
     def _export_content(self, variant: str) -> tuple[str, str, str]:
         if variant == "zh":
             return self._load_translated_md(), "zh", "中文译文"
-        if variant == "reading":
-            return self._ensure_reading_md(), "reading", "精简正文"
-        if variant == "bilingual":
-            return self._ensure_bilingual_md(), "bilingual", "中英对照"
+        if variant == "zh_compact":
+            return make_compact_markdown(self._load_translated_md()), "zh_compact", "中文译文简洁版"
         raise ValueError("未知下载类型。")
 
     async def download_export(self, variant: str, file_format: str):
@@ -628,7 +693,6 @@ class TranslateState(rx.State):
         self.folder_path = ""
         self.original_md = ""
         self.translated_md = ""
-        self.bilingual_md = ""
         self.original_html = ""
         self.translated_html = ""
         self.current_task_token = ""
@@ -720,13 +784,8 @@ def download_menu() -> rx.Component:
             ),
             rx.menu.item(
                 rx.icon(tag="file_text", size=14),
-                "精简正文 PDF",
-                on_click=TranslateState.download_export("reading", "pdf"),
-            ),
-            rx.menu.item(
-                rx.icon(tag="book_open", size=14),
-                "中英对照 PDF",
-                on_click=TranslateState.download_export("bilingual", "pdf"),
+                "中文译文简洁版 PDF",
+                on_click=TranslateState.download_export("zh_compact", "pdf"),
             ),
             rx.menu.separator(),
             rx.menu.item(
@@ -736,13 +795,8 @@ def download_menu() -> rx.Component:
             ),
             rx.menu.item(
                 rx.icon(tag="file_code", size=14),
-                "精简正文 Markdown",
-                on_click=TranslateState.download_export("reading", "md"),
-            ),
-            rx.menu.item(
-                rx.icon(tag="file_code", size=14),
-                "中英对照 Markdown",
-                on_click=TranslateState.download_export("bilingual", "md"),
+                "中文译文简洁版 Markdown",
+                on_click=TranslateState.download_export("zh_compact", "md"),
             ),
         ),
     )
@@ -843,12 +897,88 @@ def control_bar() -> rx.Component:
 # ---------------------------------------------------------------------------
 
 
+def markdown_preview(content: rx.Var[str], placeholder: str) -> rx.Component:
+    return rx.cond(
+        content != "",
+        rx.markdown(
+            content,
+            component_map={
+                "p": lambda text: rx.text(
+                    text,
+                    font_size="calc(var(--base-font) * 0.9)",
+                    line_height="1.75",
+                    margin_bottom="0.75rem",
+                    color=UISettingsState.text_color,
+                ),
+                "li": lambda text: rx.list.item(
+                    text,
+                    font_size="calc(var(--base-font) * 0.9)",
+                    line_height="1.75",
+                    color=UISettingsState.text_color,
+                ),
+                "h1": lambda text: rx.heading(
+                    text,
+                    size="5",
+                    margin="0.8rem 0 0.6rem",
+                    color=UISettingsState.text_color,
+                ),
+                "h2": lambda text: rx.heading(
+                    text,
+                    size="4",
+                    margin="0.8rem 0 0.6rem",
+                    color=UISettingsState.text_color,
+                ),
+                "h3": lambda text: rx.heading(
+                    text,
+                    size="3",
+                    margin="0.7rem 0 0.5rem",
+                    color=UISettingsState.text_color,
+                ),
+                "code": lambda text: rx.code(
+                    text,
+                    white_space="pre-wrap",
+                    font_size="calc(var(--base-font) * 0.82)",
+                ),
+            },
+        ),
+        rx.text(
+            placeholder,
+            font_size="calc(var(--base-font) * 0.84)",
+            color=UISettingsState.muted_text_color,
+        ),
+    )
+
+
+def preview_pair_row(pair: rx.Var[dict]) -> rx.Component:
+    return rx.grid(
+        rx.box(
+            markdown_preview(pair["original"], ""),
+            padding="1rem",
+            font_size="calc(var(--base-font) * 0.88)",
+            line_height="1.7",
+            min_width="0",
+        ),
+        rx.box(
+            markdown_preview(pair["translated"], ""),
+            padding="1rem",
+            border_left="1px solid #e5e7eb",
+            font_size="calc(var(--base-font) * 0.88)",
+            line_height="1.7",
+            min_width="0",
+        ),
+        columns="1fr 1fr",
+        width="100%",
+        align_items="start",
+        border_bottom="1px solid #f1f5f9",
+    )
+
+
 def preview_panel() -> rx.Component:
     return panel(
         rx.vstack(
             rx.grid(
                 rx.box(
-                    rx.text("原文 (Markdown)", font_size="calc(var(--base-font) * 0.84)", font_weight="700", color=UISettingsState.text_color),
+                    rx.text("原文预览", font_size="calc(var(--base-font) * 0.84)", font_weight="700", color=UISettingsState.text_color),
                     padding="0.75rem 1rem",
                     border_bottom="1px solid #e5e7eb",
                 ),
@@ -862,65 +992,41 @@ def preview_panel() -> rx.Component:
                 width="100%",
                 bg=UISettingsState.muted_bg,
             ),
-            rx.grid(
-                rx.box(
-                    rx.cond(
-                        TranslateState.original_html != "",
-                        rx.html(TranslateState.original_html),
-                        rx.text("解析后显示原文", font_size="calc(var(--base-font) * 0.84)", color=UISettingsState.muted_text_color),
+            rx.box(
+                rx.cond(
+                    TranslateState.preview_pairs.length() > 0,
+                    rx.vstack(
+                        rx.foreach(TranslateState.preview_pairs, preview_pair_row),
+                        spacing="0",
+                        width="100%",
                     ),
-                    padding="1rem",
-                    overflow_y="auto",
-                    max_height="60vh",
-                    font_size="calc(var(--base-font) * 0.88)",
-                    line_height="1.7",
-                    id="preview-left",
-                ),
-                rx.box(
-                    rx.cond(
-                        TranslateState.translated_html != "",
-                        rx.html(TranslateState.translated_html),
-                        rx.text("翻译后显示中文译文", font_size="calc(var(--base-font) * 0.84)", color=UISettingsState.muted_text_color),
+                    rx.grid(
+                        rx.box(
+                            rx.text(
+                                "解析后显示原文",
+                                font_size="calc(var(--base-font) * 0.84)",
+                                color=UISettingsState.muted_text_color,
+                            ),
+                            padding="1rem",
+                        ),
+                        rx.box(
+                            rx.text(
+                                "翻译后显示中文译文",
+                                font_size="calc(var(--base-font) * 0.84)",
+                                color=UISettingsState.muted_text_color,
+                            ),
+                            padding="1rem",
+                            border_left="1px solid #e5e7eb",
+                        ),
+                        columns="1fr 1fr",
+                        width="100%",
                     ),
-                    padding="1rem",
-                    border_left="1px solid #e5e7eb",
-                    overflow_y="auto",
-                    max_height="60vh",
-                    font_size="calc(var(--base-font) * 0.88)",
-                    line_height="1.7",
-                    id="preview-right",
                 ),
-                columns="1fr 1fr",
                 width="100%",
                 min_height="400px",
+                max_height="60vh",
+                overflow_y="auto",
             ),
-            rx.script("""
-(function(){
-  let ticking = false;
-  function syncScroll(source, target) {
-    if (ticking) return;
-    ticking = true;
-    requestAnimationFrame(() => {
-      const pct = source.scrollTop / (source.scrollHeight - source.clientHeight || 1);
-      target.scrollTop = pct * (target.scrollHeight - target.clientHeight);
-      ticking = false;
-    });
-  }
-  function setup() {
-    const L = document.getElementById('preview-left');
-    const R = document.getElementById('preview-right');
-    if (!L || !R) return;
-    if (L.scrollHeight <= L.clientHeight) return;
-    R.addEventListener('scroll', () => syncScroll(R, L));
-    L.addEventListener('scroll', () => syncScroll(L, R));
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', setup);
-  } else {
-    setup();
-  }
-})();
-"""),
             spacing="0",
             width="100%",
         ),

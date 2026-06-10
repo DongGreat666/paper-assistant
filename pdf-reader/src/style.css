@@ -492,8 +492,11 @@ html, body, #root {
   border: 1px solid #e5e7eb;
   border-radius: 10px;
   width: 360px;
+  max-height: min(72vh, 680px);
   box-shadow: 0 4px 20px rgba(0,0,0,0.12);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .translation-float-header {
@@ -568,6 +571,10 @@ html, body, #root {
   color: #111827;
   line-height: 1.72;
   padding: 12px 14px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .markdown-result {

@@ -45,10 +45,7 @@ def content() -> rx.Component:
         rx.el.input(id="pdf-save-translation", type="hidden"),
         rx.el.input(id="pdf-save-rects", type="hidden"),
         rx.el.input(id="pdf-save-page", type="hidden"),
-        rx.el.input(id="pdf-move-id", type="hidden"),
-        rx.el.input(id="pdf-move-text", type="hidden"),
-        rx.el.input(id="pdf-move-rects", type="hidden"),
-        rx.el.input(id="pdf-move-page", type="hidden"),
+
         rx.button(
             id="pdf-select-trigger",
             on_click=LibraryState.handle_select(
@@ -108,16 +105,6 @@ def content() -> rx.Component:
             ),
             style={"display": "none"},
         ),
-        rx.button(
-            id="pdf-move-trigger",
-            on_click=LibraryState.handle_move_freetext(
-                rx.Var("document.getElementById('pdf-move-id').value"),
-                rx.Var("document.getElementById('pdf-move-text').value"),
-                rx.Var("document.getElementById('pdf-move-rects').value"),
-                rx.Var("parseInt(document.getElementById('pdf-move-page').value) || 0"),
-            ),
-            style={"display": "none"},
-        ),
         # Hidden inputs for PIN_TRANSLATION
         rx.el.input(id="pdf-pin-id", type="hidden"),
         rx.el.input(id="pdf-pin-text", type="hidden"),
@@ -141,6 +128,12 @@ def content() -> rx.Component:
         rx.el.input(id="pdf-explain-image", type="hidden"),
         rx.el.input(id="pdf-explain-rects", type="hidden"),
         rx.el.input(id="pdf-explain-page", type="hidden"),
+        rx.el.input(id="pdf-explain-mode", type="hidden"),
+        rx.el.input(
+            id="right-panel-open",
+            type="hidden",
+            value=rx.cond(LibraryState.right_panel_open, "1", "0"),
+        ),
         rx.button(
             id="pdf-explain-trigger",
             on_click=LibraryState.handle_explain_request(
@@ -149,6 +142,7 @@ def content() -> rx.Component:
                 rx.Var("document.getElementById('pdf-explain-image').value"),
                 rx.Var("document.getElementById('pdf-explain-rects').value"),
                 rx.Var("parseInt(document.getElementById('pdf-explain-page').value) || 0"),
+                rx.Var("document.getElementById('pdf-explain-mode').value || 'floating'"),
             ),
             style={"display": "none"},
         ),
@@ -220,13 +214,6 @@ window.__pdfBridge.on('library-page', function(msg) {
     document.getElementById('pdf-save-page').value = msg.page || 0;
     document.getElementById('pdf-save-trigger').click();
   }
-  if (msg.type === 'MOVE_FREETEXT' && msg.text) {
-    document.getElementById('pdf-move-id').value = msg.id || '';
-    document.getElementById('pdf-move-text').value = msg.text || '';
-    document.getElementById('pdf-move-rects').value = JSON.stringify(msg.rects || []);
-    document.getElementById('pdf-move-page').value = msg.page || 0;
-    document.getElementById('pdf-move-trigger').click();
-  }
   if (msg.type === 'PIN_TRANSLATION' && msg.result) {
     document.getElementById('pdf-pin-id').value = msg.id || '';
     document.getElementById('pdf-pin-text').value = msg.text || '';
@@ -236,11 +223,19 @@ window.__pdfBridge.on('library-page', function(msg) {
     document.getElementById('pdf-pin-trigger').click();
   }
   if (msg.type === 'EXPLAIN_REQUEST') {
+    var explainMode = document.getElementById('right-panel-open').value === '1' ? 'sidebar' : 'floating';
     document.getElementById('pdf-explain-id').value = msg.id || '';
     document.getElementById('pdf-explain-text').value = msg.text || '';
     document.getElementById('pdf-explain-image').value = msg.image || '';
     document.getElementById('pdf-explain-rects').value = JSON.stringify(msg.rects || []);
     document.getElementById('pdf-explain-page').value = msg.page || 0;
+    document.getElementById('pdf-explain-mode').value = explainMode;
+    if (explainMode === 'sidebar') {
+      var explainIframe = document.querySelector('iframe[src*="pdf-reader"]');
+      if (explainIframe && explainIframe.contentWindow) {
+        explainIframe.contentWindow.postMessage({type: 'EXPLAIN_DISMISS', id: msg.id || ''}, window.location.origin);
+      }
+    }
     document.getElementById('pdf-explain-trigger').click();
   }
   if (msg.type === 'PAGE_CHANGED') {
@@ -251,9 +246,16 @@ window.__pdfBridge.on('library-page', function(msg) {
 """),
         # Top toolbar
         toolbar(),
+        rx.el.input(
+            id="right-panel-width-input",
+            type="hidden",
+            on_change=LibraryState.set_right_panel_width,
+        ),
+        rx.script(RIGHT_PANEL_RESIZE_JS),
         # Main area
         rx.box(
             pdf_area(),
+            right_panel_edge(),
             right_content_panel(),
             activity_bar(),
             display="flex",
@@ -1064,7 +1066,31 @@ def _chat_message(msg: rx.Var[dict]) -> rx.Component:
             ),
             # AI message: left-aligned, gray bubble
             rx.box(
-                rx.text(msg["content"], font_size="calc(var(--base-font) * 0.82)", line_height="1.6", color=UISettingsState.text_color, word_break="break-word"),
+                rx.markdown(
+                    msg["content"],
+                    component_map={
+                        "p": lambda text: rx.text(
+                            text,
+                            font_size="calc(var(--base-font) * 0.82)",
+                            line_height="1.7",
+                            color=UISettingsState.text_color,
+                            margin_bottom="0.55rem",
+                            word_break="break-word",
+                        ),
+                        "li": lambda text: rx.list.item(
+                            text,
+                            font_size="calc(var(--base-font) * 0.82)",
+                            line_height="1.7",
+                            color=UISettingsState.text_color,
+                            margin_bottom="0.3rem",
+                        ),
+                        "code": lambda text: rx.code(
+                            text,
+                            font_size="calc(var(--base-font) * 0.76)",
+                            white_space="pre-wrap",
+                        ),
+                    },
+                ),
                 bg=UISettingsState.muted_bg,
                 border_radius="12px 12px 12px 2px",
                 padding="8px 12px",
@@ -1075,26 +1101,8 @@ def _chat_message(msg: rx.Var[dict]) -> rx.Component:
     )
 
 
-def _scope_btn(label: str, scope_value: str) -> rx.Component:
-    """A single scope toggle button."""
-    is_active = LibraryState.chat_scope == scope_value
-    return rx.button(
-        label,
-        size="1",
-        variant="ghost",
-        on_click=LibraryState.set_chat_scope(scope_value),
-        bg=rx.cond(is_active, rx.cond(UISettingsState.theme == "dark", "#1e3a5f", "#eff6ff"), "transparent"),
-        color=rx.cond(is_active, "#2563eb", "#6b7280"),
-        border=rx.cond(is_active, "1px solid #bfdbfe", "1px solid transparent"),
-        font_size="calc(var(--base-font) * 0.72)",
-        font_weight=rx.cond(is_active, "600", "400"),
-        border_radius="6px",
-        cursor="pointer",
-    )
-
-
 def _chat_tab() -> rx.Component:
-    """Paper Q&A tab content with scope selector and message list."""
+    """Paper Q&A tab content with message list and input."""
     return rx.vstack(
         rx.vstack(
             rx.hstack(
@@ -1111,32 +1119,17 @@ def _chat_tab() -> rx.Component:
                 width="100%",
                 align="center",
             ),
-            rx.text("针对当前论文或选中文本提问", font_size="calc(var(--base-font) * 0.72)", color=UISettingsState.muted_text_color),
+            rx.text("基于当前论文全文背景提问", font_size="calc(var(--base-font) * 0.72)", color=UISettingsState.muted_text_color),
             spacing="1",
             align_items="start",
             width="100%",
         ),
-        # Scope selector
-        rx.hstack(
-            rx.text("作用域", font_size="calc(var(--base-font) * 0.72)", color=UISettingsState.muted_text_color, font_weight="600"),
-            rx.hstack(
-                _scope_btn("选区", "selection"),
-                _scope_btn("论文", "paper"),
-                spacing="1",
-            ),
-            width="100%",
-            align="center",
-            justify="between",
-            padding="0 2px",
-        ),
-        # Selected text reference card — moved into input area below
-        # (see input area section)
         # Message list
         rx.box(
             rx.cond(
                 LibraryState.chat_messages.length() == 0,
                 rx.box(
-                    rx.text("选中文本后可在此提问，或切换到全文模式。", font_size="calc(var(--base-font) * 0.76)", color=UISettingsState.muted_text_color, text_align="center", padding="40px 0"),
+                    rx.text("可以直接追问当前论文，解释结果也会同步到这里。", font_size="calc(var(--base-font) * 0.76)", color=UISettingsState.muted_text_color, text_align="center", padding="40px 0"),
                     width="100%",
                 ),
                 rx.vstack(
@@ -1189,22 +1182,7 @@ def _chat_tab() -> rx.Component:
                     width="100%",
                     margin_bottom="6px",
                 ),
-                rx.cond(
-                    LibraryState.chat_scope == "paper",
-                    # Paper scope, no selection
-                    rx.hstack(
-                        rx.icon(tag="book_open", size=12, color=UISettingsState.muted_text_color),
-                        rx.text("全文模式", font_size="calc(var(--base-font) * 0.72)", color=UISettingsState.muted_text_color),
-                        spacing="1",
-                        align="center",
-                        padding="4px 8px",
-                        bg=UISettingsState.muted_bg,
-                        border_radius="6px",
-                        width="100%",
-                        margin_bottom="6px",
-                    ),
-                    rx.box(),
-                ),
+                rx.box(),
             ),
             rx.el.form(
                 rx.hstack(
@@ -1411,6 +1389,116 @@ def activity_bar() -> rx.Component:
     )
 
 
+RIGHT_PANEL_RESIZE_JS = """
+(function() {
+  if (window.__paperAssistantRightResizeBound) return;
+  window.__paperAssistantRightResizeBound = true;
+
+  document.addEventListener('mousedown', function(event) {
+  var handle = event.target && event.target.closest('#right-panel-resize-handle');
+  if (!handle) return;
+  if (!event || event.button !== 0) return;
+  var panel = document.getElementById('right-content-panel');
+  var input = document.getElementById('right-panel-width-input');
+  if (!panel) return;
+  event.preventDefault();
+  event.stopPropagation();
+
+  var startX = event.clientX;
+  var startWidth = panel.getBoundingClientRect().width || 360;
+  var iframes = Array.from(document.querySelectorAll('iframe'));
+  var oldIframePointerEvents = iframes.map(function(frame) { return frame.style.pointerEvents; });
+
+  document.body.style.cursor = 'col-resize';
+  document.body.style.userSelect = 'none';
+  iframes.forEach(function(frame) { frame.style.pointerEvents = 'none'; });
+
+  function applyWidth(width) {
+    var next = Math.max(280, Math.min(720, Math.round(width)));
+    panel.style.width = next + 'px';
+    panel.style.minWidth = next + 'px';
+    panel.style.marginRight = '0px';
+    return next;
+  }
+
+  function onMove(moveEvent) {
+    applyWidth(startWidth + startX - moveEvent.clientX);
+  }
+
+  function onUp(upEvent) {
+    var next = applyWidth(startWidth + startX - upEvent.clientX);
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    iframes.forEach(function(frame, index) {
+      frame.style.pointerEvents = oldIframePointerEvents[index] || '';
+    });
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+    if (input) {
+      input.value = String(next);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+  });
+})()
+"""
+
+
+def right_panel_edge() -> rx.Component:
+    """Resize and collapse affordance between the paper and right panel."""
+    return rx.box(
+        rx.box(
+            id="right-panel-resize-handle",
+            width="10px",
+            height="100%",
+            cursor=rx.cond(LibraryState.right_open, "col-resize", "default"),
+            pointer_events=rx.cond(LibraryState.right_open, "auto", "none"),
+            bg="transparent",
+            flex_shrink="0",
+            style={
+                "position": "relative",
+                "z_index": "4",
+                "touch_action": "none",
+            },
+        ),
+        rx.button(
+            rx.cond(
+                LibraryState.right_open,
+                rx.icon(tag="chevron_right", size=16),
+                rx.icon(tag="chevron_left", size=16),
+            ),
+            on_click=LibraryState.toggle_right,
+            variant="ghost",
+            size="1",
+            title=rx.cond(LibraryState.right_open, "收起右侧面板", "展开右侧面板"),
+            width="28px",
+            height="56px",
+            min_width="28px",
+            border_radius="14px 0 0 14px",
+            bg=UISettingsState.surface_bg,
+            color=UISettingsState.muted_text_color,
+            border=f"1px solid {UISettingsState.border_color}",
+            border_right="none",
+            box_shadow="0 6px 18px rgba(15, 23, 42, 0.12)",
+            position="absolute",
+            right="-10px",
+            top="50%",
+            transform="translateY(-50%)",
+            z_index="6",
+            _hover={"color": UISettingsState.text_color, "bg": UISettingsState.muted_bg},
+        ),
+        width="10px",
+        min_width="10px",
+        height="100%",
+        position="relative",
+        flex_shrink="0",
+    )
+
+
 def right_content_panel() -> rx.Component:
     """Slide-in content panel next to the activity bar."""
     return rx.box(
@@ -1434,17 +1522,21 @@ def right_content_panel() -> rx.Component:
             _model_tab(),
             rx.box(),
         ),
-        width="320px",
-        min_width="320px",
+        id="right-content-panel",
+        width=rx.cond(LibraryState.right_open, LibraryState.right_panel_width_css, "0px"),
+        min_width=rx.cond(LibraryState.right_open, LibraryState.right_panel_width_css, "0px"),
+        max_width=rx.cond(LibraryState.right_open, LibraryState.right_panel_width_css, "0px"),
+        flex_basis=rx.cond(LibraryState.right_open, LibraryState.right_panel_width_css, "0px"),
+        display=rx.cond(LibraryState.right_open, "block", "none"),
         height="100%",
         bg=UISettingsState.surface_bg,
-        border_left=f"1px solid {UISettingsState.border_color}",
+        border_left=rx.cond(LibraryState.right_open, f"1px solid {UISettingsState.border_color}", "0"),
         overflow="hidden",
         style={
-            "transition": "margin-right 0.2s ease, opacity 0.2s ease",
+            "transition": "width 0.2s ease, min-width 0.2s ease, opacity 0.2s ease",
             "pointer-events": rx.cond(LibraryState.right_open, "auto", "none"),
         },
-        margin_right=rx.cond(LibraryState.right_open, "0px", "-320px"),
+        margin_right="0px",
         opacity=rx.cond(LibraryState.right_open, "1", "0"),
         flex_shrink="0",
     )
@@ -1452,27 +1544,61 @@ def right_content_panel() -> rx.Component:
 
 def annotation_item(item) -> rx.Component:
     return panel(
-        rx.hstack(
+        rx.cond(
+            item["id"] == LibraryState.editing_annotation_id,
             rx.vstack(
-                rx.text(item["kind"], font_size="calc(var(--base-font) * 0.68)", color="#2f5bea", font_weight="700"),
-                rx.text(item["text"], font_size="calc(var(--base-font) * 0.75)", color=UISettingsState.text_color),
-                rx.text(item["note"], font_size="calc(var(--base-font) * 0.72)", color=UISettingsState.muted_text_color),
-                spacing="1",
+                rx.text(item["text"], font_size="calc(var(--base-font) * 0.72)", color=UISettingsState.muted_text_color),
+                rx.text_area(
+                    value=LibraryState.editing_annotation_note,
+                    on_change=LibraryState.set_editing_annotation_note,
+                    width="100%",
+                    min_height="72px",
+                    font_size="calc(var(--base-font) * 0.74)",
+                ),
+                rx.hstack(
+                    rx.button("取消", on_click=LibraryState.cancel_edit_annotation, variant="ghost", size="1"),
+                    rx.button("保存", on_click=LibraryState.save_annotation_edit, size="1"),
+                    justify_content="end",
+                    width="100%",
+                    spacing="2",
+                ),
+                spacing="2",
+                width="100%",
+            ),
+            rx.hstack(
+                rx.vstack(
+                    rx.text(item["kind"], font_size="calc(var(--base-font) * 0.68)", color="#2f5bea", font_weight="700"),
+                    rx.text(item["text"], font_size="calc(var(--base-font) * 0.75)", color=UISettingsState.text_color),
+                    rx.text(item["note"], font_size="calc(var(--base-font) * 0.72)", color=UISettingsState.muted_text_color),
+                    spacing="1",
+                    align_items="start",
+                    flex="1",
+                    min_width="0",
+                ),
+                rx.hstack(
+                    rx.button(
+                        rx.icon(tag="pencil", size=14),
+                        on_click=LibraryState.start_edit_annotation(item["id"]),
+                        variant="ghost",
+                        size="1",
+                        color=UISettingsState.muted_text_color,
+                        flex_shrink="0",
+                    ),
+                    rx.button(
+                        rx.icon(tag="trash-2", size=14),
+                        on_click=LibraryState.delete_annotation(item["id"]),
+                        variant="ghost",
+                        size="1",
+                        color=UISettingsState.muted_text_color,
+                        flex_shrink="0",
+                        _hover={"color": "#ef4444"},
+                    ),
+                    spacing="1",
+                    flex_shrink="0",
+                ),
                 align_items="start",
-                flex="1",
-                min_width="0",
+                width="100%",
             ),
-            rx.button(
-                rx.icon(tag="trash-2", size=14),
-                on_click=LibraryState.delete_annotation(item["id"]),
-                variant="ghost",
-                size="1",
-                color=UISettingsState.muted_text_color,
-                flex_shrink="0",
-                _hover={"color": "#ef4444"},
-            ),
-            align_items="start",
-            width="100%",
         ),
         padding="6px",
         width="100%",

@@ -10,8 +10,10 @@ import type { IHighlight, ScaledPosition, Content } from "react-pdf-highlighter"
 import { sendMessage, onMessage, sendPageChanged } from "./bridge";
 import { HIGHLIGHT_COLORS } from "./types";
 import type { HighlightColor, AnnotationType, TranslationEntry } from "./types";
+import katex from "katex";
 
 import "react-pdf-highlighter/dist/style.css";
+import "katex/dist/katex.min.css";
 import "./style.css";
 
 const params = new URLSearchParams(window.location.search);
@@ -126,8 +128,8 @@ function mergeSelectionRects(position: ScaledPosition): ScaledPosition {
       };
       const overlap = verticalOverlap(rect, groupBox);
       return (
-        Math.abs(centerY - groupCenter) <= Math.max(height, groupHeight) * 0.85 ||
-        overlap >= Math.min(height, groupHeight) * 0.35
+        Math.abs(centerY - groupCenter) <= Math.max(height, groupHeight) * 0.55 ||
+        overlap >= Math.min(height, groupHeight) * 0.55
       );
     });
     if (group) group.push(rect);
@@ -188,6 +190,45 @@ function mergeSelectionRects(position: ScaledPosition): ScaledPosition {
   } as ScaledPosition;
 }
 
+function toBackendRect(rect: any) {
+  return {
+    x1: rect.x1,
+    y1: rect.y1,
+    x2: rect.x2,
+    y2: rect.y2,
+    width: rect.width,
+    height: rect.height,
+    pageNumber: rect.pageNumber,
+    placement: rect.placement,
+  };
+}
+
+async function compressImageDataUrl(dataUrl: string, maxSide = 768, quality = 0.68): Promise<string> {
+  if (!dataUrl || !dataUrl.startsWith("data:image/")) return dataUrl;
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      if (scale >= 1 && dataUrl.length < 300_000) {
+        resolve(dataUrl);
+        return;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        resolve(dataUrl);
+        return;
+      }
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -197,11 +238,51 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+function decodeHtmlLite(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function renderMath(tex: string, displayMode = false): string {
+  try {
+    return katex.renderToString(decodeHtmlLite(tex).trim(), {
+      displayMode,
+      throwOnError: false,
+      strict: false,
+      trust: false,
+    });
+  } catch {
+    const tag = displayMode ? "div" : "span";
+    return `<${tag} class="${displayMode ? "math-display" : "math-inline"}">${escapeHtml(tex)}</${tag}>`;
+  }
+}
+
 function renderInlineMarkdown(value: string): string {
-  let html = escapeHtml(value);
+  const mathSnippets: string[] = [];
+  const stashMath = (html: string) => {
+    const token = `@@MATH_${mathSnippets.length}@@`;
+    mathSnippets.push(html);
+    return token;
+  };
+
+  const source = value
+    .replace(/\\\((.+?)\\\)/g, (_match, tex) => stashMath(renderMath(tex)))
+    .replace(/\$([^$\n]+)\$/g, (_match, tex) => stashMath(renderMath(tex)));
+
+  let html = escapeHtml(source);
   html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-  html = html.replace(/\$([^$\n]+)\$/g, '<span class="math-inline">$1</span>');
+  html = html.replace(/`([^`]+)`/g, (_match, code) => {
+    const raw = decodeHtmlLite(code);
+    if (/[\\_^{}=]/.test(raw)) {
+      return renderMath(raw);
+    }
+    return `<code>${code}</code>`;
+  });
+  html = html.replace(/@@MATH_(\d+)@@/g, (_match, index) => mathSnippets[Number(index)] || "");
   return html;
 }
 
@@ -225,11 +306,31 @@ function markdownToHtml(markdown: string): string {
     listItems = [];
   };
 
-  for (const rawLine of lines) {
+  for (let i = 0; i < lines.length; i += 1) {
+    const rawLine = lines[i];
     const line = rawLine.trim();
     if (!line) {
       flushParagraph();
       flushList();
+      continue;
+    }
+    if (line === "$$" || line === "\\[") {
+      flushParagraph();
+      flushList();
+      const end = line === "$$" ? "$$" : "\\]";
+      const mathLines: string[] = [];
+      i += 1;
+      while (i < lines.length && lines[i].trim() !== end) {
+        mathLines.push(lines[i]);
+        i += 1;
+      }
+      blocks.push(renderMath(mathLines.join("\n"), true));
+      continue;
+    }
+    if (line.startsWith("$$") && line.endsWith("$$") && line.length > 4) {
+      flushParagraph();
+      flushList();
+      blocks.push(renderMath(line.slice(2, -2), true));
       continue;
     }
     if (/^[-*_]{3,}$/.test(line)) {
@@ -405,7 +506,7 @@ function SelectionToolbar({
         </svg>
       </button>
 
-      <button className="stb-btn" title="批注" onClick={() => { onAnnotate(); onClose(); }}>
+      <button className="stb-btn" title="批注" onClick={onAnnotate}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
         </svg>
@@ -528,74 +629,6 @@ function FloatTrans({ entry, onClose, onSave, onPin }: {
 
 // ─── Main App ──────────────────────────────────────────────────────
 
-function TranslationPlacement({
-  entry,
-  onCancel,
-  onConfirm,
-}: {
-  entry: TranslationEntry;
-  onCancel: () => void;
-  onConfirm: (box: DOMRect) => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState(() => {
-    const rect = entry.rects?.[entry.rects.length - 1];
-    const page = entry.page || rect?.pageNumber || 1;
-    const pageEl = document.querySelector(`[data-page-number="${page}"]`) as HTMLElement | null;
-    if (!rect || !pageEl) {
-      return { x: Math.max(80, window.innerWidth / 2 - 150), y: 160 };
-    }
-    const pageRect = pageEl.getBoundingClientRect();
-    const relative = Math.max(rect.x1 || 0, rect.y1 || 0, rect.x2 || 0, rect.y2 || 0) <= 1;
-    return {
-      x: pageRect.left + (relative ? rect.x1 * pageRect.width : rect.x1),
-      y: pageRect.top + (relative ? rect.y2 * pageRect.height : rect.y2) + 8,
-    };
-  });
-  const dragRef = useRef({ dragging: false, startX: 0, startY: 0, startPosX: 0, startPosY: 0 });
-
-  const onMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    dragRef.current = {
-      dragging: true,
-      startX: e.clientX,
-      startY: e.clientY,
-      startPosX: pos.x,
-      startPosY: pos.y,
-    };
-    const onMouseMove = (ev: MouseEvent) => {
-      if (!dragRef.current.dragging) return;
-      setPos({
-        x: dragRef.current.startPosX + (ev.clientX - dragRef.current.startX),
-        y: dragRef.current.startPosY + (ev.clientY - dragRef.current.startY),
-      });
-    };
-    const onMouseUp = () => {
-      dragRef.current.dragging = false;
-      document.removeEventListener("mousemove", onMouseMove);
-      document.removeEventListener("mouseup", onMouseUp);
-    };
-    document.addEventListener("mousemove", onMouseMove);
-    document.addEventListener("mouseup", onMouseUp);
-  }, [pos]);
-
-  return (
-    <div ref={ref} className="translation-placement" style={{ left: pos.x, top: pos.y }}>
-      <div className="translation-placement-header" onMouseDown={onMouseDown}>
-        <span>拖动译文框到写入位置</span>
-        <button onClick={onCancel}>×</button>
-      </div>
-      <div className="translation-placement-body">{entry.result}</div>
-      <div className="translation-placement-actions">
-        <button onClick={onCancel}>取消</button>
-        <button className="primary" onClick={() => ref.current && onConfirm(ref.current.getBoundingClientRect())}>
-          写入 PDF
-        </button>
-      </div>
-    </div>
-  );
-}
-
 function App() {
   const [highlights, setHighlights] = useState<IHighlight[]>([]);
   const [colorMap, setColorMap] = useState<Map<string, string>>(new Map());
@@ -614,8 +647,6 @@ function App() {
   const [areaSelectMode, setAreaSelectMode] = useState(false);
   // Translation entries (shared by both modes)
   const [translations, setTranslations] = useState<TranslationEntry[]>([]);
-  const [placement, setPlacement] = useState<TranslationEntry | null>(null);
-  const [placementMode, setPlacementMode] = useState<"create" | "move">("create");
   const scrollRef = useRef<((highlight: IHighlight) => void) | null>(null);
   const pdfHighlighterRef = useRef<any>(null);
   const autoTranslateRef = useRef(false);
@@ -667,6 +698,15 @@ function App() {
             return next;
           });
           break;
+        case "UPDATE_HIGHLIGHT_COMMENT":
+          setHighlights((prev) =>
+            prev.map((h) =>
+              h.id === msg.id
+                ? { ...h, comment: { ...(h.comment || {}), text: msg.comment, translation: msg.comment, emoji: "" } }
+                : h
+            )
+          );
+          break;
         case "TRANSLATE_RESULT": {
           const { id, translation } = msg;
           setTranslations((prev) =>
@@ -679,6 +719,11 @@ function App() {
           setTranslations((prev) =>
             prev.map((t) => t.id === id ? { ...t, loading: false, result: explanation } : t)
           );
+          break;
+        }
+        case "EXPLAIN_DISMISS": {
+          const { id } = msg;
+          setTranslations((prev) => prev.filter((t) => t.id !== id));
           break;
         }
         case "UNPIN_TRANSLATION": {
@@ -704,21 +749,17 @@ function App() {
           }
           break;
         }
-        case "START_TRANSLATION_PLACEMENT": {
-          setPlacementMode("create");
-          setPlacement({
-            id: msg.id,
-            text: msg.text,
-            result: msg.translation,
-            loading: false,
-            rects: msg.rects,
-            page: msg.page,
+        case "UPDATE_HIGHLIGHT_TYPE": {
+          setTypeMap((prev) => {
+            const next = new Map(prev);
+            next.set(msg.id, msg.annotationType);
+            return next;
           });
           break;
         }
       }
     });
-  }, [placementMode]);
+  }, []);
 
   const undoLast = useCallback(() => {
     const current = highlightsRef.current;
@@ -847,9 +888,7 @@ function App() {
     if (!text) return;
     const normalizedPosition = mergeSelectionRects(position);
 
-    const rects = (normalizedPosition.rects || []).map((r: any) => ({
-      x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2, pageNumber: r.pageNumber,
-    }));
+    const rects = (normalizedPosition.rects || []).map(toBackendRect);
     const page = normalizedPosition.pageNumber || (rects[0]?.pageNumber) || 0;
 
     if (mode === "floating") {
@@ -876,7 +915,7 @@ function App() {
     });
   }, []);
 
-  const requestExplanationForSelection = useCallback((
+  const requestExplanationForSelection = useCallback(async (
     position: ScaledPosition,
     content: Content,
     image?: string
@@ -884,9 +923,7 @@ function App() {
     const id = genId();
     const text = (content.text || "").trim();
     const normalizedPosition = mergeSelectionRects(position);
-    const rects = (normalizedPosition.rects || []).map((r: any) => ({
-      x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2, pageNumber: r.pageNumber,
-    }));
+    const rects = (normalizedPosition.rects || []).map(toBackendRect);
     const page = normalizedPosition.pageNumber || (rects[0]?.pageNumber) || 0;
     const entry: TranslationEntry = {
       id,
@@ -900,11 +937,12 @@ function App() {
       const pinned = prev.filter((t) => t.pinned);
       return [entry, ...pinned];
     });
+    const compressedImage = image ? await compressImageDataUrl(image) : image;
     sendMessage({
       type: "EXPLAIN_REQUEST",
       id,
       text,
-      image,
+      image: compressedImage,
       rects,
       page,
       mode: "floating",
@@ -920,9 +958,9 @@ function App() {
     setToolbarPos(null);
   }, [pendingSelection, requestTranslationForSelection]);
 
-  const requestExplanation = useCallback(() => {
+  const requestExplanation = useCallback(async () => {
     if (!pendingSelection) return;
-    requestExplanationForSelection(
+    await requestExplanationForSelection(
       mergeSelectionRects(pendingSelection.position),
       pendingSelection.content,
       (pendingSelection.content as any).image
@@ -937,71 +975,25 @@ function App() {
     setToolbarPos(null);
   }, []);
 
-  // Save translation to PDF (float mode)
+  // Save translation to PDF — writes a single Highlight with translation as content
   const saveTranslationToPdf = useCallback((entry: TranslationEntry) => {
     if (!entry.result || !entry.rects || !entry.page) return;
-    setPlacementMode("create");
-    setPlacement(entry);
-  }, []);
-
-  const moveWrittenFreetext = useCallback((highlight: any) => {
-    const text = (highlight.comment as any)?.translation || (highlight.comment as any)?.text || "";
-    const rects = (highlight.position?.rects || []).map((r: any) => ({
-      x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2, pageNumber: r.pageNumber,
-    }));
-    const page = highlight.position?.pageNumber || rects[0]?.pageNumber || 0;
-    if (!text || !rects.length || !page) return;
-    setPlacementMode("move");
-    setPlacement({
-      id: highlight.id,
-      text,
-      result: text,
-      loading: false,
-      rects,
-      page,
+    sendMessage({
+      type: "SAVE_TRANSLATION",
+      id: entry.id,
+      text: entry.text,
+      translation: entry.result,
+      rects: entry.rects,
+      page: entry.page,
     });
-  }, []);
-
-  const confirmTranslationPlacement = useCallback((entry: TranslationEntry, box: DOMRect) => {
-    if (!entry.result) return;
-    const centerX = box.left + box.width / 2;
-    const centerY = box.top + box.height / 2;
-    const pageEl = document
-      .elementsFromPoint(centerX, centerY)
-      .map((el) => el instanceof HTMLElement ? el.closest("[data-page-number]") : null)
-      .find((el): el is HTMLElement => el instanceof HTMLElement);
-    if (!pageEl) return;
-    const pageRect = pageEl.getBoundingClientRect();
-    const page = Number(pageEl.dataset.pageNumber || entry.page || 1);
-    const placedRect = {
-      x1: Math.max(0, (box.left - pageRect.left) / pageRect.width),
-      y1: Math.max(0, (box.top - pageRect.top) / pageRect.height),
-      x2: Math.min(1, (box.right - pageRect.left) / pageRect.width),
-      y2: Math.min(1, (box.bottom - pageRect.top) / pageRect.height),
-      pageNumber: page,
-      placement: true,
-    };
-    if (placementMode === "move") {
-      sendMessage({
-        type: "MOVE_FREETEXT",
-        id: entry.id,
-        text: entry.result,
-        rects: [placedRect],
-        page,
-      });
-    } else {
-      sendMessage({
-        type: "SAVE_TRANSLATION",
-        id: entry.id,
-        text: entry.text,
-        translation: entry.result,
-        rects: [...(entry.rects || []), placedRect],
-        page,
-      });
-    }
+    // Mark the highlight as translation type in-place
+    setTypeMap((prev) => {
+      const next = new Map(prev);
+      next.set(entry.id, "translation");
+      return next;
+    });
     setTranslations((prev) => prev.filter((t) => t.id !== entry.id));
-    setPlacement(null);
-  }, [placementMode]);
+  }, [sendMessage]);
 
   // Close translation entry (sidebar mode)
   const closeTranslation = useCallback((id: string) => {
@@ -1243,9 +1235,7 @@ function App() {
     setColorMap((prev) => new Map(prev).set(id, annotColor));
     setTypeMap((prev) => new Map(prev).set(id, "highlight"));
 
-    const rects = (position.rects || []).map((r: any) => ({
-      x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2, pageNumber: r.pageNumber,
-    }));
+    const rects = (position.rects || []).map(toBackendRect);
     const page = position.pageNumber || (rects[0]?.pageNumber) || 0;
 
     sendMessage({
@@ -1333,7 +1323,10 @@ function App() {
         <Popup
           popupContent={
             <div className="highlight-popup">
-              {commentText && (
+              {annType === "translation" && freetextText && (
+                <div className="popup-comment">{freetextText}</div>
+              )}
+              {annType !== "translation" && commentText && (
                 <div className="popup-comment">{commentText}</div>
               )}
               <button
@@ -1342,14 +1335,6 @@ function App() {
               >
                 删除
               </button>
-              {(annType === "translation" || annType === "comment") && freetextText && (
-                <button
-                  className="highlight-delete-btn"
-                  onClick={() => moveWrittenFreetext(highlight)}
-                >
-                  移动
-                </button>
-              )}
             </div>
           }
           onMouseOver={(popupContent) =>
@@ -1381,7 +1366,7 @@ function App() {
         </Popup>
       );
     },
-    [deleteHighlight, moveWrittenFreetext]
+    [deleteHighlight]
   );
 
   if (!fileUrl) {
@@ -1419,14 +1404,6 @@ function App() {
           onPin={() => pinTranslation(entry)}
         />
       ))}
-
-      {placement && (
-        <TranslationPlacement
-          entry={placement}
-          onCancel={() => setPlacement(null)}
-          onConfirm={(box) => confirmTranslationPlacement(placement, box)}
-        />
-      )}
 
       {/* Annotation input overlay */}
       {showAnnotationInput && (

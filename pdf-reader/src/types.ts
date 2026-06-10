@@ -8,7 +8,7 @@ export interface TranslationEntry {
   text: string;
   result?: string;
   loading: boolean;
-  rects?: { x1: number; y1: number; x2: number; y2: number; pageNumber: number; placement?: boolean }[];
+  rects?: { x1: number; y1: number; x2: number; y2: number; width?: number; height?: number; pageNumber: number; placement?: boolean }[];
   page?: number;
   pinned?: boolean;
   kind?: "translation" | "explanation";
@@ -41,7 +41,7 @@ export type OutMessage =
       type: "TRANSLATE_REQUEST";
       id: string;
       text: string;
-      rects: { x1: number; y1: number; x2: number; y2: number; pageNumber: number; placement?: boolean }[];
+      rects: { x1: number; y1: number; x2: number; y2: number; width?: number; height?: number; pageNumber: number; placement?: boolean }[];
       page: number;
       mode: "floating" | "sidebar";
     }
@@ -51,15 +51,7 @@ export type OutMessage =
       id: string;
       text: string;
       translation: string;
-      rects: { x1: number; y1: number; x2: number; y2: number; pageNumber: number; placement?: boolean }[];
-      page: number;
-    }
-  | {
-      source: "pdf-reader";
-      type: "MOVE_FREETEXT";
-      id: string;
-      text: string;
-      rects: { x1: number; y1: number; x2: number; y2: number; pageNumber: number; placement?: boolean }[];
+      rects: { x1: number; y1: number; x2: number; y2: number; width?: number; height?: number; pageNumber: number; placement?: boolean }[];
       page: number;
     }
   | {
@@ -68,7 +60,7 @@ export type OutMessage =
       id: string;
       text: string;
       comment: string;
-      rects: { x1: number; y1: number; x2: number; y2: number; pageNumber: number }[];
+      rects: { x1: number; y1: number; x2: number; y2: number; width?: number; height?: number; pageNumber: number }[];
       page: number;
     }
   | { source: "pdf-reader"; type: "HIGHLIGHT_CLICKED"; id: string }
@@ -80,7 +72,7 @@ export type OutMessage =
       id: string;
       text: string;
       image?: string;
-      rects: { x1: number; y1: number; x2: number; y2: number; pageNumber: number; placement?: boolean }[];
+      rects: { x1: number; y1: number; x2: number; y2: number; width?: number; height?: number; pageNumber: number; placement?: boolean }[];
       page: number;
       mode: "floating";
     }
@@ -100,11 +92,13 @@ export type InMessage =
   | { type: "SCROLL_TO"; id: string }
   | { type: "ADD_HIGHLIGHT"; highlight: IHighlight }
   | { type: "REMOVE_HIGHLIGHT"; id: string }
+  | { type: "UPDATE_HIGHLIGHT_COMMENT"; id: string; comment: string }
+  | { type: "UPDATE_HIGHLIGHT_TYPE"; id: string; annotationType: AnnotationType }
   | { type: "TRANSLATE_RESULT"; id: string; translation: string }
   | { type: "EXPLAIN_RESULT"; id: string; explanation: string }
+  | { type: "EXPLAIN_DISMISS"; id: string }
   | { type: "SET_TRANSLATE_MODE"; mode: TranslateDisplayMode }
   | { type: "UNPIN_TRANSLATION"; id: string; text: string; result: string; rects: any[]; page: number }
-  | { type: "START_TRANSLATION_PLACEMENT"; id: string; text: string; translation: string; rects: any[]; page: number }
   | { type: "AUTO_TRANSLATE"; enabled: boolean };
 
 export interface HighlightColor {

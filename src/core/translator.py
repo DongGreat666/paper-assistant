@@ -17,6 +17,7 @@ TRANSLATION_CONCURRENCY = 3
 TRANSLATION_MAX_RETRIES = 2
 TRANSLATION_RETRY_BASE_DELAY = 1.5
 TRANSLATION_STOP_POLL_INTERVAL = 0.25
+TRANSLATION_MAX_CHARS = 8000
 
 
 _EXPLANATION_MARKERS = (
@@ -32,8 +33,26 @@ _EXPLANATION_MARKERS = (
 # Markdown section splitting
 # ---------------------------------------------------------------------------
 
-# Pattern to split Markdown by top-level headings
-_HEADING_PATTERN = re.compile(r"^(#{1,3}\s+.+)$", re.MULTILINE)
+# Pattern to split Markdown by top-level headings. It is only applied to
+# lines outside fenced code blocks.
+_HEADING_PATTERN = re.compile(r"^(#{1,3}\s+.+)$")
+_FENCE_PATTERN = re.compile(r"^\s*(```|~~~)")
+_REFERENCES_HEADING_PATTERN = re.compile(
+    r"^#{1,6}\s+(?:"
+    r"(?:\d+(?:\.\d+)*[.)]?\s+)?"
+    r"(?:references|bibliography|works cited|literature cited)"
+    r"|参考文献"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_APPENDIX_HEADING_PATTERN = re.compile(
+    r"^#{1,6}\s+(?:"
+    r"appendix(?:es)?(?:\s+.*)?"
+    r"|附录(?:\s+.*)?"
+    r"|[A-Z](?:\.\d+)*[.)]?\s+.+"
+    r")$",
+    re.IGNORECASE,
+)
 
 
 def split_markdown_into_sections(md_text: str) -> list[str]:
@@ -42,30 +61,33 @@ def split_markdown_into_sections(md_text: str) -> list[str]:
     Each section includes the heading line and its body.
     If no headings found, split by double newlines (paragraphs).
     """
-    parts = _HEADING_PATTERN.split(md_text)
+    lines = md_text.splitlines(keepends=True)
+    sections: list[str] = []
+    current: list[str] = []
+    in_fence = False
 
-    if len(parts) <= 1:
-        # No headings found — split by blank lines
+    for line in lines:
+        if _FENCE_PATTERN.match(line):
+            in_fence = not in_fence
+
+        is_heading = not in_fence and bool(_HEADING_PATTERN.match(line.rstrip("\n")))
+        if is_heading and current:
+            section = "".join(current).strip()
+            if section:
+                sections.append(section)
+            current = [line]
+        else:
+            current.append(line)
+
+    if current:
+        section = "".join(current).strip()
+        if section:
+            sections.append(section)
+
+    if not any(_HEADING_PATTERN.match(s.splitlines()[0]) for s in sections if s.splitlines()):
         return _split_by_paragraphs(md_text)
 
-    sections: list[str] = []
-    i = 0
-    # parts[0] is text before first heading (preamble)
-    if parts[0].strip():
-        sections.append(parts[0])
-
-    while i < len(parts):
-        if _HEADING_PATTERN.match(parts[i]):
-            heading = parts[i]
-            body = parts[i + 1] if i + 1 < len(parts) else ""
-            sections.append(heading + body)
-            i += 2
-        else:
-            if parts[i].strip():
-                sections.append(parts[i])
-            i += 1
-
-    return [s for s in sections if s.strip()]
+    return sections
 
 
 def _split_by_paragraphs(md_text: str, max_chars: int = 3000) -> list[str]:
@@ -90,8 +112,96 @@ def _split_by_paragraphs(md_text: str, max_chars: int = 3000) -> list[str]:
     return sections
 
 
+def _is_markdown_table_block(block: str) -> bool:
+    """Return whether a Markdown block is a table that should be preserved."""
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    if all(line.startswith("|") for line in lines):
+        return True
+    separator_pattern = re.compile(
+        r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+    )
+    return sum("|" in line for line in lines) >= 2 and any(
+        separator_pattern.match(line) for line in lines
+    )
+
+
+def _split_long_text(text: str, max_chars: int) -> list[str]:
+    """Split oversized prose near line, sentence, or whitespace boundaries."""
+    if len(text) <= max_chars:
+        return [text]
+
+    pieces: list[str] = []
+    remaining = text.strip()
+    while len(remaining) > max_chars:
+        window = remaining[: max_chars + 1]
+        candidates = [
+            window.rfind("\n"),
+            max(window.rfind(mark) for mark in (". ", "? ", "! ", "。", "？", "！", "; ")),
+            window.rfind(" "),
+        ]
+        split_at = max(candidates)
+        if split_at < max_chars // 2:
+            split_at = max_chars
+        else:
+            split_at += 1
+        pieces.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+
+    if remaining:
+        pieces.append(remaining)
+    return pieces
+
+
+def split_section_for_translation(
+    section: str,
+    max_chars: int = TRANSLATION_MAX_CHARS,
+) -> list[tuple[str, bool]]:
+    """Split a section into bounded translation units and preserved blocks.
+
+    The boolean indicates whether the block should be sent to the translation
+    engine. Markdown tables and fenced code blocks are preserved verbatim.
+    """
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", section) if block.strip()]
+    units: list[tuple[str, bool]] = []
+    current: list[str] = []
+    current_length = 0
+
+    def flush_current() -> None:
+        nonlocal current, current_length
+        if current:
+            units.append(("\n\n".join(current), True))
+            current = []
+            current_length = 0
+
+    for block in blocks:
+        stripped = block.strip()
+        preserve = (
+            _is_markdown_table_block(block)
+            or ("<table" in stripped.lower() and "</table>" in stripped.lower())
+            or (stripped.startswith("```") and stripped.endswith("```"))
+            or (stripped.startswith("~~~") and stripped.endswith("~~~"))
+        )
+        if preserve:
+            flush_current()
+            units.append((block, False))
+            continue
+
+        for piece in _split_long_text(block, max_chars):
+            added_length = len(piece) + (2 if current else 0)
+            if current and current_length + added_length > max_chars:
+                flush_current()
+                added_length = len(piece)
+            current.append(piece)
+            current_length += added_length
+
+    flush_current()
+    return units
+
+
 def should_skip_section(section: str) -> bool:
-    """Check if a section is pure formula/image and should not be translated."""
+    """Check if a section should be preserved without translation."""
     stripped = section.strip()
 
     # Pure display math block
@@ -109,6 +219,36 @@ def should_skip_section(section: str) -> bool:
     return False
 
 
+def reference_section_indexes(sections: list[str]) -> set[int]:
+    """Return the final reference-list range, stopping before any appendix."""
+    headings = [
+        re.sub(
+            r"<span\b[^>]*>\s*</span>\s*",
+            "",
+            section.strip().splitlines()[0].strip(),
+            flags=re.IGNORECASE,
+        )
+        if section.strip()
+        else ""
+        for section in sections
+    ]
+    reference_starts = [
+        index
+        for index, heading in enumerate(headings)
+        if _REFERENCES_HEADING_PATTERN.match(heading)
+    ]
+    if not reference_starts:
+        return set()
+
+    start = reference_starts[-1]
+    end = len(sections)
+    for index in range(start + 1, len(sections)):
+        if _APPENDIX_HEADING_PATTERN.match(headings[index]):
+            end = index
+            break
+    return set(range(start, end))
+
+
 def clean_translation_output(text: str) -> str:
     """Remove common assistant explanations from translation-only responses."""
     result = (text or "").strip()
@@ -123,6 +263,20 @@ def clean_translation_output(text: str) -> str:
             break
 
     return result
+
+
+def _code_fence_count(text: str) -> int:
+    return sum(1 for line in text.splitlines() if line.strip().startswith("```"))
+
+
+def _validate_translated_markdown_structure(source: str, translated: str) -> None:
+    """Reject translations that break Markdown code fences."""
+    source_fences = _code_fence_count(source)
+    translated_fences = _code_fence_count(translated)
+    if source_fences != translated_fences:
+        raise ValueError(
+            f"Markdown code fence mismatch: source={source_fences}, translated={translated_fences}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +333,11 @@ async def translate_section(
                 "2. 忠实翻译原文，不要扩写，不要补充原文没有的信息。\n"
                 "3. 保留所有数学公式（LaTeX）、文献引用标记原样不变。\n"
                 "4. 翻译需符合中文学术表达习惯。\n"
-                "5. 如遇 OCR 导致的断行或碎裂单词，自动修复。"
+                "5. 如遇 OCR 导致的断行或碎裂单词，自动修复。\n"
+                "6. 严格保留 Markdown 结构：标题层级、列表、表格、图片链接、数学公式分隔符、引用链接不能丢失或新增。\n"
+                "7. 严格保留代码块围栏：原文中每一个开头 ``` 和结尾 ``` 都必须在译文中保留，数量和顺序一致。\n"
+                "8. 代码块内部不要改成普通 Markdown。以 # 开头的代码注释仍然是代码注释，不能变成 Markdown 标题。\n"
+                "9. 代码块内的变量名、函数名、缩进、标点和换行保持不变；只翻译自然语言注释或说明。"
             ),
         },
         {"role": "user", "content": text},
@@ -223,6 +381,7 @@ async def translate_markdown(
 
     engine = engine or get_default_translation_engine()
     sections = split_markdown_into_sections(md_text)
+    reference_indexes = reference_section_indexes(sections)
     total = len(sections)
     translated_count = 0
     semaphore = asyncio.Semaphore(TRANSLATION_CONCURRENCY)
@@ -272,7 +431,10 @@ async def translate_markdown(
                 return section
             try:
                 result = await _translate_once(section)
-                return section if result is None else result
+                if result is None:
+                    return section
+                _validate_translated_markdown_structure(section, result)
+                return result
             except asyncio.TimeoutError as exc:
                 last_error = exc
                 if attempt >= TRANSLATION_MAX_RETRIES:
@@ -294,14 +456,19 @@ async def translate_markdown(
         nonlocal translated_count
         if should_stop and should_stop():
             result = section
-        elif should_skip_section(section):
+        elif idx in reference_indexes or should_skip_section(section):
             result = section
         else:
-            async with semaphore:
+            translated_units: list[str] = []
+            for unit, should_translate in split_section_for_translation(section):
                 if should_stop and should_stop():
-                    result = section
+                    translated_units.append(unit)
+                elif not should_translate or should_skip_section(unit):
+                    translated_units.append(unit)
                 else:
-                    result = await _translate_with_retries(section)
+                    async with semaphore:
+                        translated_units.append(await _translate_with_retries(unit))
+            result = "\n\n".join(translated_units)
         translated_count += 1
         if on_progress:
             await on_progress(translated_count, total)

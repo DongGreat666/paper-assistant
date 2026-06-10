@@ -27,8 +27,10 @@ env/
 *.swp
 *.swo
 
-# Environment variables (contains secrets!)
+# Environment variables and local backups (may contain secrets!)
 .env
+.env.*
+!.env.example
 
 # Data directories (runtime-generated)
 data/vector_db/
@@ -37,6 +39,7 @@ data/cache/
 data/settings.json
 data/translation_engines.json
 data/secrets.json
+data/chat_engines.json
 
 # User papers (user's files, don't commit)
 papers/*.pdf
@@ -66,7 +69,7 @@ scripts/*.ris
 uploaded_files/
 
 # Local ML model cache
-models/
+/models/
 
 # Local frontend dependency cache
 pdf-reader/node_modules/

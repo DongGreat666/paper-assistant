@@ -1,5 +1,7 @@
 """State and backend events for the home chat page."""
 
+import logging
+
 import reflex as rx
 
 from config import get_config
@@ -25,6 +27,7 @@ from src.ui.pages.home_model_service import (
 )
 from src.ui.pages.home_upload_service import prepare_document, save_upload
 
+logger = logging.getLogger(__name__)
 
 _model_defaults = resolve_model_defaults()
 
@@ -32,14 +35,16 @@ _model_defaults = resolve_model_defaults()
 def _load_engines_safe() -> list[dict]:
     try:
         return load_engine_profiles()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to load engine profiles: {e}")
         return []
 
 
 def _list_conversations_safe() -> list[dict]:
     try:
         return chat_history.list_conversations()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to list conversations: {e}")
         return []
 
 
