@@ -31,10 +31,9 @@ from src.core.engine import (
 )
 from src.core.translator import translate_inline, translate_section
 from src.core.chat_engine import extract_nearby_text, extract_full_text, build_chat_messages, chat_with_context
-from config import read_settings
-from paths import PROJECT_ROOT
+from config import get_config, read_settings
 
-UPLOAD_DIR = PROJECT_ROOT / "uploaded_files"
+UPLOAD_DIR = get_config().papers_dir.resolve()
 
 
 @dataclass
@@ -86,7 +85,7 @@ EVENT_BUS_JS = """
 
 
 def _scan_papers() -> list[dict]:
-    """Scan uploaded_files/ for PDF papers."""
+    """Scan the configured papers directory for PDF papers."""
     papers = []
     if not UPLOAD_DIR.exists():
         return papers
@@ -283,7 +282,7 @@ class LibraryState(rx.State):
         return f"{type(exc).__name__}: {detail}"
 
     def load_papers(self):
-        """Load paper list from uploaded_files/."""
+        """Load papers from the configured papers directory."""
         self.papers = _scan_papers()
         folder_counts: dict[str, int] = {}
         for p in self.papers:
@@ -382,7 +381,7 @@ class LibraryState(rx.State):
             self.file_status = f"打开目录失败：{exc}"
 
     def create_folder(self):
-        """Create a new folder in uploaded_files/."""
+        """Create a new folder in the configured papers directory."""
         name = self._safe_name(self.new_folder_name)
         if not name:
             return

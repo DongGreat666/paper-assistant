@@ -48,8 +48,8 @@ The following directories are intentionally excluded from Git:
 
 - `data/`: local settings, secrets, history, and caches.
 - `models/`: Marker model cache.
-- `uploaded_files/`: imported papers and generated outputs.
+- `MyPapers/`: imported papers, parsed assets, and translations grouped by paper.
 - `.web/`: generated Reflex frontend.
 - `logs/` and `artifacts/`: disposable diagnostics and test output.
 
-Do not delete `models/` or `uploaded_files/` during routine cleanup.
+Do not delete `models/` or `MyPapers/` during routine cleanup.

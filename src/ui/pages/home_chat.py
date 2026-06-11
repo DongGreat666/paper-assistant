@@ -178,12 +178,13 @@ def chat_input() -> rx.Component:
     return rx.box(
         rx.form(
             rx.vstack(
-                rx.el.input(
+                rx.input(
                     id="chat-composer-input",
                     placeholder="问论文任何问题...",
                     value=HomeState.input_text,
                     on_change=HomeState.set_input,
                     type="text",
+                    variant="soft",
                     width="100%",
                     border="0",
                     bg="transparent",

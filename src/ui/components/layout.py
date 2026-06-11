@@ -2,6 +2,7 @@
 
 import reflex as rx
 
+from config import get_config
 from src.ui.state import UISettingsState
 
 
@@ -182,7 +183,7 @@ def sidebar(
         ),
         rx.vstack(
             rx.text("本地论文目录", font_size="calc(var(--base-font) * 0.72)", color="#8a94a6"),
-            rx.text("./uploaded_files", font_size="calc(var(--base-font) * 0.78)", color="#3b4556", font_weight="600"),
+            rx.text(str(get_config().papers_dir), font_size="calc(var(--base-font) * 0.78)", color="#3b4556", font_weight="600"),
             spacing="1",
             align_items="start",
             padding="1rem",

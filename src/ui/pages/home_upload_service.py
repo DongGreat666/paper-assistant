@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from config import get_config
 from src.core.document_parser import (
     parse_pdf_to_markdown,
     parse_docx_to_markdown,
@@ -12,7 +13,7 @@ from src.core.document_parser import (
 )
 
 
-UPLOAD_DIR = Path("uploaded_files")
+PAPERS_DIR = get_config().papers_dir.resolve()
 MAX_PDF_CONTEXT_CHARS = 60000
 
 
@@ -78,7 +79,7 @@ async def save_upload(upload: Any) -> SavedUpload:
     safe_name = Path(upload.filename).name
     suffix = Path(safe_name).suffix.lower()
     stem = short_stem(safe_name)
-    folder = UPLOAD_DIR / stem
+    folder = PAPERS_DIR / stem
     folder.mkdir(parents=True, exist_ok=True)
     destination = folder / safe_name
     data = await upload.read()

@@ -76,10 +76,10 @@ Assistant 环境，否则可能破坏 Marker 的依赖版本。
 
 - `data/`：设置、模型接口配置、密钥引用和聊天记录。
 - `models/`：Marker PDF 解析模型。
-- `uploaded_files/`：导入的论文与生成结果。
+- `MyPapers/`：导入的论文、解析结果和译文；每篇论文及其生成文件保存在同一文件夹。
 - `.web/`：Reflex 自动生成的前端缓存。
 
-日常清理时不要删除 `models/` 和 `uploaded_files/`。
+日常清理时不要删除 `models/` 和 `MyPapers/`。
 
 ## 第三方 PDF 解析器
 

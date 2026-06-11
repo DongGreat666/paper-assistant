@@ -15,7 +15,7 @@ paper-assistant/
 ├── docs/                           项目文档与开发记录
 │   └── notes/                      专项问题分析记录
 ├── models/                         Marker PDF 解析模型缓存
-├── papers/                         配置层保留的通用论文目录
+├── MyPapers/                       本地论文、解析结果、译文和导出文件
 ├── paper_assistant/                Reflex 应用入口与路由注册
 ├── pdf-reader/                     React PDF 阅读器前端源码
 │   ├── public/                     阅读器公共静态资源
@@ -31,7 +31,6 @@ paper-assistant/
 │   │   ├── components/             通用布局组件
 │   │   └── pages/                  各业务页面及其服务
 │   └── utils/                      通用辅助模块
-├── uploaded_files/                 导入论文、解析结果、译文和导出文件
 ├── .env                            本机密钥与运行配置，不提交
 ├── .env.example                    可公开的环境变量模板
 ├── config.py                       配置读取、覆盖和本地目录初始化
@@ -46,12 +45,12 @@ paper-assistant/
 | 应用功能 | 页面与状态 | 核心逻辑 | 前端或数据 |
 |---|---|---|---|
 | 首页聊天与文档问答 | `src/ui/pages/home*.py` | `src/core/chat_engine.py`、`chat_history.py`、`engine.py` | `data/chat_history/` |
-| 论文库与 PDF 阅读 | `src/ui/pages/library.py`、`library_ui.py` | `src/core/pdf_annotations.py`、`chat_engine.py` | `pdf-reader/`、`assets/pdf-reader/`、`uploaded_files/` |
+| 论文库与 PDF 阅读 | `src/ui/pages/library.py`、`library_ui.py` | `src/core/pdf_annotations.py`、`chat_engine.py` | `pdf-reader/`、`assets/pdf-reader/`、`MyPapers/` |
 | PDF 高亮、划线和批注 | `src/ui/pages/library.py` | `src/core/pdf_annotations.py` | `pdf-reader/src/App.tsx` |
 | 选区解释、翻译与右侧问答 | `src/ui/pages/library.py`、`library_ui.py` | `src/core/chat_engine.py`、`engine.py` | `pdf-reader/src/App.tsx`、`bridge.ts` |
-| PDF 解析为 Markdown | `src/ui/pages/translate.py` | `src/core/document_parser.py`、`markdown_repair.py` | `models/`、`uploaded_files/` |
+| PDF 解析为 Markdown | `src/ui/pages/translate.py` | `src/core/document_parser.py`、`markdown_repair.py` | `models/`、`MyPapers/` |
 | 整篇翻译 | `src/ui/pages/translate.py` | `src/core/translator.py`、`engine.py` | `data/translation_engines.json` |
-| Markdown/PDF/简洁版导出 | `src/ui/pages/translate.py` | `src/core/exporter.py`、`pdf_translation.py` | `uploaded_files/` |
+| Markdown/PDF/简洁版导出 | `src/ui/pages/translate.py` | `src/core/exporter.py`、`pdf_translation.py` | `MyPapers/` |
 | 模型和存储设置 | `src/ui/pages/settings.py`、`home_model_*.py` | `config.py`、`src/core/engine.py` | `.env`、`data/*.json` |
 
 ## 关键目录说明
@@ -105,7 +104,7 @@ Reflex 用户界面：
 
 Marker 使用的本地模型缓存。体积较大，但 PDF 解析依赖它；删除后需要重新下载模型。
 
-### `uploaded_files/`
+### `MyPapers/`
 
 论文工作区。每篇论文通常拥有独立文件夹，包含原始 PDF、解析 Markdown、图片、译文和导出文件。它是用户数据，不属于可随意清理的构建缓存。
 

@@ -105,7 +105,7 @@ class Config:
         self.chunk_overlap: int = _safe_int(os.getenv("CHUNK_OVERLAP"), 50)
 
         # --- Paths ---
-        self.papers_dir: Path = Path(os.getenv("PAPERS_DIR", "./papers"))
+        self.papers_dir: Path = Path(os.getenv("PAPERS_DIR", "./MyPapers"))
         self.data_dir: Path = Path(os.getenv("DATA_DIR", "./data"))
         self.vector_db_dir: Path = self.data_dir / "vector_db"
         self.chat_history_dir: Path = self.data_dir / "chat_history"

@@ -1186,12 +1186,13 @@ def _chat_tab() -> rx.Component:
             ),
             rx.el.form(
                 rx.hstack(
-                    rx.el.input(
+                    rx.input(
                         placeholder="输入你的问题...",
                         value=LibraryState.chat_input,
                         on_change=LibraryState.set_chat_input,
                         flex="1",
                         size="1",
+                        variant="soft",
                         border_radius="8px",
                         border=f"1px solid {UISettingsState.border_color}",
                         padding="6px 10px",

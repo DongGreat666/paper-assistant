@@ -1,11 +1,10 @@
 """Reflex app entry point for Paper Assistant."""
 
-from pathlib import Path
-
 import reflex as rx
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 
+from config import get_config
 from src.core.pdf_annotations import read_highlights
 from src.ui.pages.home import home_page
 from src.ui.pages.library import LibraryState
@@ -14,11 +13,11 @@ from src.ui.pages.settings import settings_page
 from src.ui.pages.translate import translate_page
 
 # --- PDF file serving ---
-UPLOAD_DIR = Path("uploaded_files").resolve()
+UPLOAD_DIR = get_config().papers_dir.resolve()
 
 
 async def serve_pdf(request: Request):
-    """Serve a PDF file from the uploaded_files directory."""
+    """Serve a PDF file from the configured papers directory."""
     file_path = request.path_params["path"]
     full_path = (UPLOAD_DIR / file_path).resolve()
 
