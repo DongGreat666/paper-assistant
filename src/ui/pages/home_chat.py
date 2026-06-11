@@ -114,7 +114,7 @@ def empty_state() -> rx.Component:
                 text_align="center",
             ),
             rx.text(
-                "上传 PDF、Word 或 Markdown 文件后提问，按 Enter 发送。",
+                "上传 PDF、DOCX、Markdown、TXT 或图片，也可在输入框粘贴截图。",
                 font_size="calc(var(--base-font) * 0.92)",
                 color=UISettingsState.muted_text_color,
                 text_align="center",
@@ -144,6 +144,18 @@ def message_bubble(message) -> rx.Component:
         rx.cond(
             is_user,
             rx.box(
+                rx.cond(
+                    message.get("image_data_url", "") != "",
+                    rx.image(
+                        src=message.get("image_data_url", ""),
+                        max_width="420px",
+                        max_height="320px",
+                        object_fit="contain",
+                        border_radius="8px",
+                        margin_bottom="0.5rem",
+                    ),
+                    rx.box(),
+                ),
                 rx.text(
                     message["content"],
                     white_space="pre-wrap",
@@ -176,17 +188,89 @@ def message_bubble(message) -> rx.Component:
 
 def chat_input() -> rx.Component:
     return rx.box(
+        rx.el.input(id="chat-paste-image-data", type="hidden"),
+        rx.button(
+            id="chat-paste-image-trigger",
+            on_click=HomeState.attach_pasted_image(
+                rx.Var("document.getElementById('chat-paste-image-data').value"),
+            ),
+            style={"display": "none"},
+        ),
+        rx.script(
+            """
+if (!window.__paperAssistantPasteInstalled) {
+  window.__paperAssistantPasteInstalled = true;
+  document.addEventListener('paste', function(event) {
+    var composer = document.getElementById('chat-composer-input');
+    if (!composer || document.activeElement !== composer) return;
+    var items = Array.from((event.clipboardData && event.clipboardData.items) || []);
+    var imageItem = items.find(function(item) { return item.type.indexOf('image/') === 0; });
+    if (!imageItem) return;
+    event.preventDefault();
+    var file = imageItem.getAsFile();
+    if (!file) return;
+    var image = new Image();
+    image.onload = function() {
+      var maxSide = 2000;
+      var scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+      var canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+      var input = document.getElementById('chat-paste-image-data');
+      var trigger = document.getElementById('chat-paste-image-trigger');
+      if (input && trigger) {
+        input.value = canvas.toDataURL('image/jpeg', 0.9);
+        trigger.click();
+      }
+      URL.revokeObjectURL(image.src);
+    };
+    image.src = URL.createObjectURL(file);
+  });
+}
+"""
+        ),
+        rx.cond(
+            HomeState.pending_image_data_url != "",
+            rx.hstack(
+                rx.image(
+                    src=HomeState.pending_image_data_url,
+                    max_width="180px",
+                    max_height="120px",
+                    object_fit="contain",
+                    border_radius="8px",
+                ),
+                rx.vstack(
+                    rx.text(HomeState.pending_image_name, font_size="calc(var(--base-font) * 0.78)", font_weight="600"),
+                    rx.text("图片将随下一条消息发送", font_size="calc(var(--base-font) * 0.72)", color=UISettingsState.muted_text_color),
+                    align_items="start",
+                    spacing="1",
+                ),
+                rx.spacer(),
+                rx.button(
+                    rx.icon(tag="x", size=14),
+                    on_click=HomeState.clear_pending_image,
+                    variant="ghost",
+                    color_scheme="gray",
+                    type="button",
+                ),
+                width="100%",
+                padding="0.65rem 0.8rem 0",
+                align="center",
+            ),
+            rx.box(),
+        ),
         rx.form(
             rx.vstack(
-                rx.input(
+                rx.el.input(
                     id="chat-composer-input",
+                    name="message",
                     placeholder="问论文任何问题...",
-                    value=HomeState.input_text,
-                    on_change=HomeState.set_input,
+                    default_value=HomeState.input_text,
                     type="text",
-                    variant="soft",
                     width="100%",
                     min_width="0",
+                    box_sizing="border-box",
                     border="0",
                     bg="transparent",
                     padding="1rem 1rem 0.75rem",
@@ -198,7 +282,9 @@ def chat_input() -> rx.Component:
                 width="100%",
                 min_width="0",
             ),
+            id="chat-composer-form",
             on_submit=HomeState.submit,
+            reset_on_submit=True,
             width="100%",
             min_width="0",
         ),
@@ -224,9 +310,10 @@ def chat_input() -> rx.Component:
                 rx.icon(tag=rx.cond(HomeState.is_chatting, "loader_circle", "send"), size=17),
                 rx.cond(HomeState.is_chatting, "生成中", "发送"),
                 id="chat-composer-submit",
+                form="chat-composer-form",
+                type="submit",
                 size="2",
                 disabled=HomeState.is_chatting | HomeState.is_preparing,
-                on_click=HomeState.submit,
             ),
             width="100%",
             align="center",

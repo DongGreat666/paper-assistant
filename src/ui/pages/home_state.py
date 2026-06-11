@@ -1,6 +1,7 @@
 """State and backend events for the home chat page."""
 
 import logging
+from pathlib import Path
 
 import reflex as rx
 
@@ -11,6 +12,7 @@ from src.core.engine import (
     load_engine_profiles,
 )
 from src.core import chat_history
+from src.core.markdown_math import normalize_math_delimiters, normalize_message_math
 from src.ui.pages.home_chat_service import stream_chat_completion, trim_context
 from src.ui.pages.home_model_service import (
     build_home_engine,
@@ -25,7 +27,12 @@ from src.ui.pages.home_model_service import (
     start_edit_engine_action,
     test_profile,
 )
-from src.ui.pages.home_upload_service import prepare_document, save_upload
+from src.ui.pages.home_upload_service import (
+    delete_upload_source,
+    image_data_url,
+    prepare_document,
+    save_chat_upload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +69,8 @@ class HomeState(rx.State):
     is_chatting: bool = False
     status_message: str = "上传文件后即可提问。"
     messages: list[dict] = []
+    pending_image_data_url: str = ""
+    pending_image_name: str = ""
 
     # Conversation persistence
     conversation_id: str = ""
@@ -119,7 +128,16 @@ class HomeState(rx.State):
     async def handle_upload(self, files: list[rx.UploadFile]):
         if not files:
             return
-        saved = await save_upload(files[0])
+        saved = await save_chat_upload(files[0])
+        if saved.suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+            self._delete_pending_image_source()
+            self.pending_image_data_url = image_data_url(saved.data, saved.safe_name)
+            self.pending_image_name = saved.safe_name
+            self.saved_path = str(saved.destination)
+            self.folder_path = str(saved.folder)
+            self.status_message = "图片已附加，输入问题后即可发送。"
+            yield
+            return
 
         self.file_name = saved.safe_name
         self.saved_path = str(saved.destination)
@@ -152,20 +170,43 @@ class HomeState(rx.State):
                 }
             ]
         finally:
+            delete_upload_source(saved)
+            self.saved_path = ""
             self.is_preparing = False
             self._save_chat()
+            yield
 
     async def submit(self, _form_data: dict):
+        self.input_text = str(_form_data.get("message", ""))
         async for event in self._send_current_message():
             yield event
 
+    def attach_pasted_image(self, data_url: str):
+        if not data_url.startswith("data:image/"):
+            return
+        self.pending_image_data_url = data_url
+        self.pending_image_name = "剪贴板图片"
+        self.status_message = "截图已附加，输入问题后即可发送。"
+
+    def clear_pending_image(self):
+        self.pending_image_data_url = ""
+        self.pending_image_name = ""
+
     async def _send_current_message(self):
         question = self.input_text.strip()
+        image_data_url = self.pending_image_data_url
+        if image_data_url and not question:
+            question = "请分析这张图片。"
         if not question or self.is_chatting:
             return
 
         self.input_text = ""
-        self.messages = self.messages + [{"role": "user", "content": question}]
+        user_message = {"role": "user", "content": question}
+        if image_data_url:
+            user_message["image_data_url"] = image_data_url
+        self.messages = self.messages + [user_message]
+        self.pending_image_data_url = ""
+        self.pending_image_name = ""
         self.is_chatting = True
         self.status_message = "正在生成回答..."
         yield
@@ -180,6 +221,7 @@ class HomeState(rx.State):
             ]
             self.is_chatting = False
             self.status_message = "缺少 API Key。"
+            self._delete_pending_image_source()
             return
 
         accumulated = ""
@@ -187,9 +229,11 @@ class HomeState(rx.State):
             # Append empty assistant message, then stream into it
             self.messages = self.messages + [{"role": "assistant", "content": ""}]
             yield
-            async for chunk in stream_chat_completion(self._build_messages(question), engine):
+            async for chunk in stream_chat_completion(self._build_messages(question, image_data_url), engine):
                 accumulated += chunk
-                self.messages = self.messages[:-1] + [{"role": "assistant", "content": accumulated}]
+                self.messages = self.messages[:-1] + [
+                    {"role": "assistant", "content": normalize_math_delimiters(accumulated)}
+                ]
                 yield
             self.status_message = "回答完成。"
         except Exception as exc:
@@ -200,10 +244,24 @@ class HomeState(rx.State):
                 ]
             self.status_message = f"调用模型失败：{exc}"
         finally:
+            self._delete_pending_image_source()
             self.is_chatting = False
             self._save_chat()
 
-    def _build_messages(self, question: str) -> list[dict]:
+    def _delete_pending_image_source(self):
+        if not self.saved_path:
+            return
+        try:
+            path = Path(self.saved_path)
+            chat_upload_root = (get_config().data_dir / "chat_uploads").resolve()
+            resolved = path.resolve()
+            if resolved.is_relative_to(chat_upload_root):
+                resolved.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.saved_path = ""
+
+    def _build_messages(self, question: str, image_data_url: str = "") -> list[dict]:
         messages: list[dict] = []
         if self.paper_ready:
             context = trim_context(self.paper_md)
@@ -223,7 +281,15 @@ class HomeState(rx.State):
             for item in history
             if item.get("role") in {"user", "assistant"}
         )
-        if not history or history[-1].get("content") != question:
+        if image_data_url:
+            messages[-1] = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            }
+        elif not history or history[-1].get("content") != question:
             messages.append({"role": "user", "content": question})
         return messages
 
@@ -312,6 +378,8 @@ class HomeState(rx.State):
         self.file_info = ""
         self.paper_md = ""
         self.paper_ready = False
+        self.pending_image_data_url = ""
+        self.pending_image_name = ""
         self.is_preparing = False
         self.is_chatting = False
         self.status_message = status_message
@@ -362,7 +430,7 @@ class HomeState(rx.State):
             self.status_message = "对话记录不存在。"
             return
         self.conversation_id = conv["id"]
-        self.messages = conv.get("messages", [])
+        self.messages = normalize_message_math(conv.get("messages", []))
         self.file_name = conv.get("paper", "")
         self.status_message = f"已加载对话：{conv.get('title', conv_id)}"
 

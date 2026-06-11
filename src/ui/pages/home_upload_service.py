@@ -1,20 +1,20 @@
 """Upload persistence and lightweight document context helpers for home chat."""
 
 import asyncio
+import base64
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from config import get_config
-from src.core.document_parser import (
-    parse_pdf_to_markdown,
-    parse_docx_to_markdown,
-    save_markdown,
-)
+from src.core.document_parser import parse_docx_to_markdown
 
 
 PAPERS_DIR = get_config().papers_dir.resolve()
+CHAT_UPLOAD_DIR = (get_config().data_dir / "chat_uploads").resolve()
 MAX_PDF_CONTEXT_CHARS = 60000
+MAX_IMAGE_SIDE = 2000
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,24 @@ def file_info(data: bytes, filename: str) -> str:
         if page_count > 0:
             info += f"  |  ~{page_count} 页"
     return info
+
+
+def image_data_url(data: bytes, _filename: str) -> str:
+    """Return a reasonably sized data URL suitable for vision-model requests."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(data)) as image:
+        image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+        if image.mode in {"RGBA", "LA"}:
+            background = Image.new("RGB", image.size, "white")
+            background.paste(image, mask=image.getchannel("A"))
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=90, optimize=True)
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 def extract_pdf_text_fast(pdf_path: str | Path, max_chars: int = MAX_PDF_CONTEXT_CHARS) -> str:
@@ -76,10 +94,20 @@ def extract_pdf_text_fast(pdf_path: str | Path, max_chars: int = MAX_PDF_CONTEXT
 
 
 async def save_upload(upload: Any) -> SavedUpload:
+    """Save an upload permanently for workflows such as full translation."""
+    return await _save_upload_to(upload, PAPERS_DIR)
+
+
+async def save_chat_upload(upload: Any) -> SavedUpload:
+    """Save a temporary source file for the home chat workflow."""
+    return await _save_upload_to(upload, CHAT_UPLOAD_DIR)
+
+
+async def _save_upload_to(upload: Any, root: Path) -> SavedUpload:
     safe_name = Path(upload.filename).name
     suffix = Path(safe_name).suffix.lower()
     stem = short_stem(safe_name)
-    folder = PAPERS_DIR / stem
+    folder = root / stem
     folder.mkdir(parents=True, exist_ok=True)
     destination = folder / safe_name
     data = await upload.read()
@@ -98,19 +126,13 @@ async def save_upload(upload: Any) -> SavedUpload:
 
 async def prepare_document(upload: SavedUpload) -> str:
     """Create or reuse markdown context for a saved upload."""
-    md_path = upload.folder / f"{upload.stem}.md"
+    md_path = upload.folder / f"{upload.stem}.parsed.md"
     loop = asyncio.get_event_loop()
 
     if upload.suffix == ".pdf":
-        pdf_md_path = upload.destination.with_suffix(".md")
-        if pdf_md_path.exists():
-            return pdf_md_path.read_text(encoding="utf-8")
-        md_text, images = await loop.run_in_executor(None, parse_pdf_to_markdown, upload.destination)
-        await loop.run_in_executor(None, save_markdown, md_text, upload.destination, images)
+        md_text = await loop.run_in_executor(None, extract_pdf_text_fast, upload.destination)
+        md_path.write_text(md_text, encoding="utf-8")
         return md_text
-
-    if md_path.exists():
-        return md_path.read_text(encoding="utf-8")
 
     if upload.suffix in (".md", ".txt"):
         md_text = upload.data.decode("utf-8", errors="replace")
@@ -120,7 +142,7 @@ async def prepare_document(upload: SavedUpload) -> str:
         md_path.write_text(md_text, encoding="utf-8")
         return md_text
 
-    if upload.suffix in (".docx", ".doc"):
+    if upload.suffix == ".docx":
         md_text = await loop.run_in_executor(
             None,
             parse_docx_to_markdown,
@@ -130,3 +152,11 @@ async def prepare_document(upload: SavedUpload) -> str:
         return md_text
 
     return ""
+
+
+def delete_upload_source(upload: SavedUpload) -> None:
+    """Delete only the uploaded source, leaving parsed Markdown intact."""
+    try:
+        upload.destination.unlink(missing_ok=True)
+    except OSError:
+        pass

@@ -31,6 +31,7 @@ from src.core.engine import (
 )
 from src.core.translator import translate_inline, translate_section
 from src.core.chat_engine import extract_nearby_text, extract_full_text, build_chat_messages, chat_with_context
+from src.core.markdown_math import normalize_math_delimiters
 from config import get_config, read_settings
 
 UPLOAD_DIR = get_config().papers_dir.resolve()
@@ -1035,7 +1036,7 @@ class LibraryState(rx.State):
         self.chat_messages = [
             *self.chat_messages,
             {"role": "user", "content": prompt, "quote": quote},
-            {"role": "assistant", "content": result, "quote": ""},
+            {"role": "assistant", "content": normalize_math_delimiters(result), "quote": ""},
         ]
         self.right_open = True
         self.right_tab = "chat"
@@ -1043,8 +1044,10 @@ class LibraryState(rx.State):
     def handle_page_changed(self, page: int):
         self.selected_page = page
 
-    async def send_chat(self):
+    async def send_chat(self, form_data: dict | None = None):
         """Send a chat message with context injection."""
+        if form_data is not None:
+            self.chat_input = str(form_data.get("message", self.chat_input))
         if not self.chat_input.strip() or self.chat_loading:
             return
         user_msg = self.chat_input.strip()
@@ -1084,7 +1087,10 @@ class LibraryState(rx.State):
                 chat_history=self.chat_messages[:-1],
             )
             result = await chat_with_context(messages, engine)
-            self.chat_messages = [*self.chat_messages, {"role": "assistant", "content": result, "quote": ""}]
+            self.chat_messages = [
+                *self.chat_messages,
+                {"role": "assistant", "content": normalize_math_delimiters(result), "quote": ""},
+            ]
         except Exception as e:
             self.chat_messages = [*self.chat_messages, {"role": "assistant", "content": f"错误：{e}", "quote": ""}]
         finally:
@@ -1233,7 +1239,7 @@ class LibraryState(rx.State):
             async with self:
                 self.chat_messages = [
                     *self.chat_messages,
-                    {"role": "assistant", "content": result, "quote": ""},
+                    {"role": "assistant", "content": normalize_math_delimiters(result), "quote": ""},
                 ]
                 self.chat_loading = False
         else:

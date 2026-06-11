@@ -43,9 +43,11 @@ def upload_button() -> rx.Component:
         accept={
             "application/pdf": [".pdf"],
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
-            "application/msword": [".doc"],
             "text/markdown": [".md"],
             "text/plain": [".txt", ".md"],
+            "image/png": [".png"],
+            "image/jpeg": [".jpg", ".jpeg"],
+            "image/webp": [".webp"],
         },
         max_files=1,
         on_drop=HomeState.handle_upload,
