@@ -1026,6 +1026,8 @@ class LibraryState(rx.State):
 
     def clear_chat(self):
         self.chat_messages = []
+        self.chat_input = ""
+        self.chat_loading = False
 
     def _attach_explanation_to_chat(self, text: str, result: str, image_data: str = ""):
         """Add a floating explanation to the Q&A thread so follow-up questions keep context."""
@@ -1734,4 +1736,3 @@ class LibraryState(rx.State):
     def clear_selection(self):
         self.selected_text = ""
         self.translation_result = ""
-

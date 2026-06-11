@@ -301,13 +301,23 @@ class HomeState(rx.State):
         import os
         os.startfile(self.folder_path)
 
-    def clear_chat(self):
+    def _reset_chat_workspace(self, status_message: str):
+        """Reset the current conversation, draft, and attached document."""
+        self.input_text = ""
         self.messages = []
         self.conversation_id = ""
         self.file_name = ""
+        self.saved_path = ""
+        self.folder_path = ""
+        self.file_info = ""
         self.paper_md = ""
         self.paper_ready = False
-        self.status_message = "对话已清空。"
+        self.is_preparing = False
+        self.is_chatting = False
+        self.status_message = status_message
+
+    def clear_chat(self):
+        self._reset_chat_workspace("对话已清空。")
 
     def _current_engine_label(self) -> str:
         return current_engine_label(self.model_auto, self.engine_name, self.engine_model)
@@ -341,15 +351,7 @@ class HomeState(rx.State):
         """Start a fresh conversation."""
         if self.messages:
             self._save_chat()
-        self.messages = []
-        self.conversation_id = ""
-        self.file_name = ""
-        self.saved_path = ""
-        self.folder_path = ""
-        self.file_info = ""
-        self.paper_md = ""
-        self.paper_ready = False
-        self.status_message = "新对话已开始。"
+        self._reset_chat_workspace("新对话已开始。")
 
     def switch_chat(self, conv_id: str):
         """Load an existing conversation."""
@@ -371,6 +373,7 @@ class HomeState(rx.State):
         if self.conversation_id == conv_id:
             self.conversation_id = ""
             self.messages = []
+            self.input_text = ""
             self.status_message = "对话已删除。"
 
     def _build_engine(self):

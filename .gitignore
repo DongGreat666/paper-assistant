@@ -67,9 +67,14 @@ scripts/*.ris
 
 # User-uploaded runtime files
 uploaded_files/
+/MyPapers/
+/PDF_Translate/
 
 # Local ML model cache
 /models/
+
+# Reflex runtime dependency lock/cache
+/reflex.lock/
 
 # Local frontend dependency cache
 pdf-reader/node_modules/
