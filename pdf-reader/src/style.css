@@ -59,6 +59,14 @@ html, body, #root {
   pointer-events: none !important;
 }
 
+/* Native PDF markup annotations sit above our interactive highlight layer. */
+.annotationLayer .highlightArea,
+.annotationLayer .underlineAnnotation,
+.annotationLayer .strikeoutAnnotation,
+.annotationLayer .squigglyAnnotation {
+  pointer-events: none !important;
+}
+
 .PdfHighlighter__highlight-layer,
 [class*="highlightLayer"],
 [class*="HighlightLayer"] {

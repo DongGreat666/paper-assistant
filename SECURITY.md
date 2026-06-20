@@ -24,7 +24,7 @@ papers, generated content, or conversation history:
 - `.env` and other `.env.*` files except `.env.example`.
 - `data/`.
 - `MyPapers/`.
-- Legacy local paper directories such as `uploaded_files/` and `papers/`.
+- Legacy local paper directories such as `paper_translation/`, `uploaded_files/`, and `papers/`.
 - `models/`.
 
 Before publishing changes, run `git status` and confirm none of these local

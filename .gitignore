@@ -41,6 +41,8 @@ data/settings.json
 data/translation_engines.json
 data/secrets.json
 data/chat_engines.json
+data/translate_last_upload.json
+data/library_last_open.json
 
 # User papers (user's files, don't commit)
 papers/*.pdf
@@ -67,6 +69,7 @@ scripts/*.png
 scripts/*.ris
 
 # User-uploaded runtime files
+paper_translation/
 uploaded_files/
 /MyPapers/
 /PDF_Translate/

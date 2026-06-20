@@ -178,10 +178,15 @@ def read_highlights(pdf_path: str) -> list[dict]:
                         continue
 
                     ar = annot.rect
-                    rel_x1 = (ar.x0 - x0_offset) / w
-                    rel_y1 = (ar.y0 - y0_offset) / h
-                    rel_x2 = (ar.x1 - x0_offset) / w
-                    rel_y2 = (ar.y1 - y0_offset) / h
+                    scaled_rect = {
+                        "x1": ar.x0 - x0_offset,
+                        "y1": ar.y0 - y0_offset,
+                        "x2": ar.x1 - x0_offset,
+                        "y2": ar.y1 - y0_offset,
+                        "width": w,
+                        "height": h,
+                        "pageNumber": page_num + 1,
+                    }
 
                     annot_id = annot.info.get("title", "") or f"ann-{page_num}-{annot.xref}"
                     info = annot.info or {}
@@ -192,18 +197,8 @@ def read_highlights(pdf_path: str) -> list[dict]:
                         highlights.append({
                             "id": annot_id,
                             "position": {
-                                "boundingRect": {
-                                    "x1": rel_x1, "y1": rel_y1,
-                                    "x2": rel_x2, "y2": rel_y2,
-                                    "width": rel_x2 - rel_x1, "height": rel_y2 - rel_y1,
-                                    "pageNumber": page_num + 1,
-                                },
-                                "rects": [{
-                                    "x1": rel_x1, "y1": rel_y1,
-                                    "x2": rel_x2, "y2": rel_y2,
-                                    "width": rel_x2 - rel_x1, "height": rel_y2 - rel_y1,
-                                    "pageNumber": page_num + 1,
-                                }],
+                                "boundingRect": dict(scaled_rect),
+                                "rects": [dict(scaled_rect)],
                                 "pageNumber": page_num + 1,
                             },
                             "content": {"text": ""},
@@ -224,18 +219,8 @@ def read_highlights(pdf_path: str) -> list[dict]:
                         highlights.append({
                             "id": annot_id,
                             "position": {
-                                "boundingRect": {
-                                    "x1": rel_x1, "y1": rel_y1,
-                                    "x2": rel_x2, "y2": rel_y2,
-                                    "width": rel_x2 - rel_x1, "height": rel_y2 - rel_y1,
-                                    "pageNumber": page_num + 1,
-                                },
-                                "rects": [{
-                                    "x1": rel_x1, "y1": rel_y1,
-                                    "x2": rel_x2, "y2": rel_y2,
-                                    "width": rel_x2 - rel_x1, "height": rel_y2 - rel_y1,
-                                    "pageNumber": page_num + 1,
-                                }],
+                                "boundingRect": dict(scaled_rect),
+                                "rects": [dict(scaled_rect)],
                                 "pageNumber": page_num + 1,
                             },
                             "content": {"text": ""},
@@ -276,18 +261,8 @@ def read_highlights(pdf_path: str) -> list[dict]:
                     highlights.append({
                         "id": annot_id,
                         "position": {
-                            "boundingRect": {
-                                "x1": rel_x1, "y1": rel_y1,
-                                "x2": rel_x2, "y2": rel_y2,
-                                "width": rel_x2 - rel_x1, "height": rel_y2 - rel_y1,
-                                "pageNumber": page_num + 1,
-                            },
-                            "rects": [{
-                                "x1": rel_x1, "y1": rel_y1,
-                                "x2": rel_x2, "y2": rel_y2,
-                                "width": rel_x2 - rel_x1, "height": rel_y2 - rel_y1,
-                                "pageNumber": page_num + 1,
-                            }],
+                            "boundingRect": dict(scaled_rect),
+                            "rects": [dict(scaled_rect)],
                             "pageNumber": page_num + 1,
                         },
                         "content": {"text": text},
@@ -485,13 +460,21 @@ def add_strikethrough(
     return True
 
 
+def _annotation_matches_id(annot, page_index: int, annot_id: str) -> bool:
+    """Match annotations with stored IDs or the fallback ID used while reading PDFs."""
+    stored_id = annot.info.get("title", "") or ""
+    return stored_id == annot_id or (
+        not stored_id and annot_id == f"ann-{page_index}-{annot.xref}"
+    )
+
+
 def delete_highlight(pdf_path: str, highlight_id: str) -> bool:
-    """Delete a PDF annotation by its ID (stored in annotation title)."""
+    """Delete a PDF annotation by its stored or read-time fallback ID."""
     with _open_pdf_for_write(pdf_path) as doc:
         deleted = False
-        for page in doc:
+        for page_index, page in enumerate(doc):
             for annot in page.annots():
-                if annot.info.get("title", "") == highlight_id:
+                if _annotation_matches_id(annot, page_index, highlight_id):
                     page.delete_annot(annot)
                     deleted = True
                     break
@@ -508,9 +491,9 @@ def update_annotation_comment(pdf_path: str, annot_id: str, comment: str) -> boo
         return False
     with _open_pdf_for_write(pdf_path) as doc:
         updated = False
-        for page in doc:
+        for page_index, page in enumerate(doc):
             for annot in page.annots():
-                if annot.info.get("title", "") != annot_id:
+                if not _annotation_matches_id(annot, page_index, annot_id):
                     continue
                 annot.set_info(content=comment)
                 annot.update()

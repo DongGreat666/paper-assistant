@@ -94,6 +94,9 @@ export type InMessage =
   | { type: "REMOVE_HIGHLIGHT"; id: string }
   | { type: "UPDATE_HIGHLIGHT_COMMENT"; id: string; comment: string }
   | { type: "UPDATE_HIGHLIGHT_TYPE"; id: string; annotationType: AnnotationType }
+  | { type: "HIGHLIGHT_SYNCED"; id: string }
+  | { type: "HIGHLIGHT_SYNC_FAILED"; id: string }
+  | { type: "HIGHLIGHT_DELETE_SYNCED"; id: string; success: boolean }
   | { type: "TRANSLATE_RESULT"; id: string; translation: string }
   | { type: "EXPLAIN_RESULT"; id: string; explanation: string }
   | { type: "EXPLAIN_DISMISS"; id: string }

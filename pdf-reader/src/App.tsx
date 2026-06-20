@@ -39,6 +39,9 @@ function getBackendUrl(url: string): string {
 }
 
 const PRIMARY_PDF_URL = getBackendUrl(fileUrl);
+const PDF_HIGHLIGHTS_PATH = fileUrl.startsWith("/api/pdf/")
+  ? decodeURIComponent(fileUrl.slice("/api/pdf/".length))
+  : "";
 let idCounter = 0;
 const genId = () => `hl-${Date.now()}-${++idCounter}`;
 const FLOAT_TRANS_POS_KEY = "paper-assistant.translationFloatPosition";
@@ -506,7 +509,7 @@ function SelectionToolbar({
         </svg>
       </button>
 
-      <button className="stb-btn" title="批注" onClick={onAnnotate}>
+      <button className="stb-btn" title="笔记" onClick={onAnnotate}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
         </svg>
@@ -659,19 +662,103 @@ function App() {
   colorMapRef.current = colorMap;
   const typeMapRef = useRef<Map<string, AnnotationType>>(new Map());
   typeMapRef.current = typeMap;
+  const pendingCreatedIdsRef = useRef<Set<string>>(new Set());
+  const pendingDeletedIdsRef = useRef<Set<string>>(new Set());
+  const deleteQueueRef = useRef<string[]>([]);
+  const deleteInFlightRef = useRef("");
+  const deleteAckTimerRef = useRef<number | null>(null);
+  const flushDeleteQueueRef = useRef<() => void>(() => {});
+
+  const flushDeleteQueue = useCallback(() => {
+    if (deleteInFlightRef.current || deleteQueueRef.current.length === 0) return;
+    const id = deleteQueueRef.current[0];
+    deleteInFlightRef.current = id;
+    sendMessage({ type: "HIGHLIGHT_DELETED", id });
+    deleteAckTimerRef.current = window.setTimeout(() => {
+      if (deleteInFlightRef.current !== id) return;
+      deleteInFlightRef.current = "";
+      flushDeleteQueueRef.current();
+    }, 5000);
+  }, []);
+  flushDeleteQueueRef.current = flushDeleteQueue;
+
+  const queueHighlightDelete = useCallback((id: string) => {
+    if (!deleteQueueRef.current.includes(id)) {
+      deleteQueueRef.current.push(id);
+    }
+    flushDeleteQueueRef.current();
+  }, []);
+
+  useEffect(() => () => {
+    if (deleteAckTimerRef.current !== null) {
+      window.clearTimeout(deleteAckTimerRef.current);
+    }
+  }, []);
+
+  const markHighlightCreated = useCallback((id: string) => {
+    pendingDeletedIdsRef.current.delete(id);
+    pendingCreatedIdsRef.current.add(id);
+  }, []);
+
+  useEffect(() => {
+    if (!PDF_HIGHLIGHTS_PATH) return;
+    let cancelled = false;
+    fetch(getBackendUrl(`/api/pdf-highlights?path=${encodeURIComponent(PDF_HIGHLIGHTS_PATH)}`), {
+      cache: "no-store",
+    })
+      .then((response) => response.json())
+      .then((loaded: any[]) => {
+        if (cancelled) return;
+        setHighlights(loaded);
+        const loadedColors = new Map<string, string>();
+        const loadedTypes = new Map<string, AnnotationType>();
+        for (const highlight of loaded) {
+          if (highlight._color) loadedColors.set(highlight.id, highlight._color);
+          if (highlight._type) loadedTypes.set(highlight.id, highlight._type as AnnotationType);
+        }
+        setColorMap(loadedColors);
+        setTypeMap(loadedTypes);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Listen for messages from Reflex parent
   useEffect(() => {
     return onMessage((msg) => {
       switch (msg.type) {
         case "LOAD_HIGHLIGHTS": {
-          const hls = msg.highlights as any[];
+          const remoteHighlights = msg.highlights as any[];
+          const remoteIds = new Set(remoteHighlights.map((highlight) => highlight.id));
+          const deletedIds = pendingDeletedIdsRef.current;
+          for (const id of [...deletedIds]) {
+            if (!remoteIds.has(id)) deletedIds.delete(id);
+          }
+          const pendingLocal = highlightsRef.current.filter(
+            (highlight) =>
+              pendingCreatedIdsRef.current.has(highlight.id) &&
+              !remoteIds.has(highlight.id) &&
+              !deletedIds.has(highlight.id)
+          );
+          for (const id of remoteIds) {
+            pendingCreatedIdsRef.current.delete(id);
+          }
+          const hls = [
+            ...remoteHighlights.filter((highlight) => !deletedIds.has(highlight.id)),
+            ...pendingLocal,
+          ];
           setHighlights(hls);
-          const newColorMap = new Map<string, string>();
-          const newTypeMap = new Map<string, AnnotationType>();
-          for (const h of hls) {
+          const newColorMap = new Map(colorMapRef.current);
+          const newTypeMap = new Map(typeMapRef.current);
+          for (const h of remoteHighlights) {
             if (h._color) newColorMap.set(h.id, h._color);
             if (h._type) newTypeMap.set(h.id, h._type as AnnotationType);
+          }
+          for (const id of deletedIds) {
+            newColorMap.delete(id);
+            newTypeMap.delete(id);
           }
           setColorMap(newColorMap);
           setTypeMap(newTypeMap);
@@ -757,6 +844,36 @@ function App() {
           });
           break;
         }
+        case "HIGHLIGHT_SYNCED":
+          // Keep it pending until a server snapshot contains it. A snapshot
+          // request may have started before the PDF write completed.
+          break;
+        case "HIGHLIGHT_SYNC_FAILED":
+          pendingCreatedIdsRef.current.delete(msg.id);
+          setHighlights((prev) => prev.filter((highlight) => highlight.id !== msg.id));
+          setColorMap((prev) => {
+            const next = new Map(prev);
+            next.delete(msg.id);
+            return next;
+          });
+          setTypeMap((prev) => {
+            const next = new Map(prev);
+            next.delete(msg.id);
+            return next;
+          });
+          break;
+        case "HIGHLIGHT_DELETE_SYNCED":
+          if (deleteInFlightRef.current === msg.id) {
+            if (deleteAckTimerRef.current !== null) {
+              window.clearTimeout(deleteAckTimerRef.current);
+              deleteAckTimerRef.current = null;
+            }
+            deleteQueueRef.current = deleteQueueRef.current.filter((id) => id !== msg.id);
+            deleteInFlightRef.current = "";
+            if (!msg.success) pendingDeletedIdsRef.current.delete(msg.id);
+            queueMicrotask(() => flushDeleteQueueRef.current());
+          }
+          break;
       }
     });
   }, []);
@@ -765,9 +882,11 @@ function App() {
     const current = highlightsRef.current;
     if (current.length === 0) return;
     const last = current[current.length - 1];
+    pendingCreatedIdsRef.current.delete(last.id);
+    pendingDeletedIdsRef.current.add(last.id);
     setHighlights(current.slice(0, -1));
-    sendMessage({ type: "HIGHLIGHT_DELETED", id: last.id });
-  }, []);
+    queueHighlightDelete(last.id);
+  }, [queueHighlightDelete]);
 
   // Ctrl+Z undo
   useEffect(() => {
@@ -794,6 +913,7 @@ function App() {
         content: { text: content.text },
         comment: { text: "", emoji: "" },
       };
+      markHighlightCreated(id);
       setHighlights((prev) => [...prev, highlight]);
       setColorMap((prev) => new Map(prev).set(id, color.hex));
       setTypeMap((prev) => new Map(prev).set(id, "highlight"));
@@ -807,7 +927,7 @@ function App() {
       setPendingSelection(null);
       setToolbarPos(null);
     },
-    [pendingSelection]
+    [pendingSelection, markHighlightCreated]
   );
 
   // Toolbar: underline with specific color
@@ -823,6 +943,7 @@ function App() {
         content: { text: content.text },
         comment: { text: "", emoji: "" },
       };
+      markHighlightCreated(id);
       setHighlights((prev) => [...prev, highlight]);
       setColorMap((prev) => new Map(prev).set(id, color.hex));
       setTypeMap((prev) => new Map(prev).set(id, "underline"));
@@ -836,7 +957,7 @@ function App() {
       setPendingSelection(null);
       setToolbarPos(null);
     },
-    [pendingSelection]
+    [pendingSelection, markHighlightCreated]
   );
 
   // Toolbar: strikethrough
@@ -852,6 +973,7 @@ function App() {
         content: { text: content.text },
         comment: { text: "", emoji: "" },
       };
+      markHighlightCreated(id);
       setHighlights((prev) => [...prev, highlight]);
       setColorMap((prev) => new Map(prev).set(id, "#EF4444"));
       setTypeMap((prev) => new Map(prev).set(id, "strikethrough"));
@@ -865,7 +987,7 @@ function App() {
       setPendingSelection(null);
       setToolbarPos(null);
     },
-    [pendingSelection]
+    [pendingSelection, markHighlightCreated]
   );
 
   // Copy selected text
@@ -1231,6 +1353,7 @@ function App() {
       comment: { text: annotationText.trim(), emoji: "" },
     };
     const annotColor = "#FFD700";
+    markHighlightCreated(id);
     setHighlights((prev) => [...prev, highlight]);
     setColorMap((prev) => new Map(prev).set(id, annotColor));
     setTypeMap((prev) => new Map(prev).set(id, "highlight"));
@@ -1250,14 +1373,16 @@ function App() {
     setAnnotationText("");
     setPendingSelection(null);
     setToolbarPos(null);
-  }, [pendingSelection, annotationText]);
+  }, [pendingSelection, annotationText, markHighlightCreated]);
 
   const deleteHighlight = useCallback((id: string) => {
+    pendingCreatedIdsRef.current.delete(id);
+    pendingDeletedIdsRef.current.add(id);
     setHighlights((prev) => prev.filter((h) => h.id !== id));
     setColorMap((prev) => { const next = new Map(prev); next.delete(id); return next; });
     setTypeMap((prev) => { const next = new Map(prev); next.delete(id); return next; });
-    sendMessage({ type: "HIGHLIGHT_DELETED", id });
-  }, []);
+    queueHighlightDelete(id);
+  }, [queueHighlightDelete]);
 
   // Compute toolbar position from ScaledPosition.boundingRect
   // boundingRect coords are CSS pixels relative to the page element (.page)
@@ -1331,7 +1456,10 @@ function App() {
               )}
               <button
                 className="highlight-delete-btn"
-                onClick={() => deleteHighlight(highlight.id)}
+                onClick={() => {
+                  hideTip();
+                  deleteHighlight(highlight.id);
+                }}
               >
                 删除
               </button>
@@ -1409,14 +1537,14 @@ function App() {
       {showAnnotationInput && (
         <div className="color-picker-overlay" onClick={() => { setShowAnnotationInput(false); setPendingSelection(null); setToolbarPos(null); }}>
           <div className="annotation-input-box" onClick={(e) => e.stopPropagation()}>
-            <div className="annotation-input-header">添加批注</div>
+            <div className="annotation-input-header">添加笔记</div>
             <div className="annotation-selected-text">
               {(pendingSelection?.content.text || "").slice(0, 100)}
               {(pendingSelection?.content.text || "").length > 100 ? "..." : ""}
             </div>
             <textarea
               className="annotation-textarea"
-              placeholder="输入批注内容..."
+              placeholder="输入笔记内容..."
               value={annotationText}
               onChange={(e) => setAnnotationText(e.target.value)}
               onKeyDown={(e) => {

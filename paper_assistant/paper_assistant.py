@@ -10,7 +10,7 @@ from src.ui.pages.home import home_page
 from src.ui.pages.library import LibraryState
 from src.ui.pages.library_ui import library_page
 from src.ui.pages.settings import settings_page
-from src.ui.pages.translate import translate_page
+from src.ui.pages.translate import TranslateState, translate_page
 
 # --- PDF file serving ---
 UPLOAD_DIR = get_config().papers_dir.resolve()
@@ -53,7 +53,10 @@ async def pdf_highlights(request: Request):
         return JSONResponse([], status_code=200)
 
     highlights = read_highlights(str(full_path))
-    return JSONResponse(highlights)
+    return JSONResponse(
+        highlights,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # --- Pages ---
@@ -68,6 +71,11 @@ app._api.add_route("/api/pdf/{path:path}", serve_pdf)
 app._api.add_route("/api/pdf-highlights", pdf_highlights)
 
 app.add_page(index, route="/", title="Paper Assistant")
-app.add_page(translate_page, route="/translate", title="论文翻译")
+app.add_page(
+    translate_page,
+    route="/translate",
+    title="论文翻译",
+    on_load=TranslateState.restore_recent_upload,
+)
 app.add_page(library_page, route="/library", title="我的论文", on_load=LibraryState.load_papers)
 app.add_page(settings_page, route="/settings", title="设置与用户")

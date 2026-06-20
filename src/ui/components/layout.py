@@ -2,7 +2,7 @@
 
 import reflex as rx
 
-from config import get_config
+from config import get_config, read_settings
 from src.ui.state import UISettingsState
 
 
@@ -12,6 +12,8 @@ NAV_ITEMS = [
     ("languages", "论文翻译", "/translate"),
     ("settings", "设置", "/settings"),
 ]
+
+BASE_FONT_CSS = f"{read_settings().get('font_size', 18)}px"
 
 
 def app_shell(
@@ -34,11 +36,6 @@ def app_shell(
         children.append(rx.box(aside, width="320px", min_width="320px", height="100vh"))
 
     return rx.box(
-        rx.html(
-            "<style>:root { --base-font: "
-            + UISettingsState.base_font_css
-            + "; }</style>"
-        ),
         rx.hstack(
             *children,
             spacing="0",
@@ -49,6 +46,7 @@ def app_shell(
         min_height="100vh",
         bg=UISettingsState.app_bg,
         color=UISettingsState.text_color,
+        style={"--base-font": BASE_FONT_CSS},
         font_family="Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     )
 

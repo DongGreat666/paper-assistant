@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from config import get_config
+from config import get_config, read_settings
 
 
 ENGINE_PROFILES_PATH = Path("data") / "translation_engines.json"
@@ -286,6 +286,26 @@ def load_engine_profiles() -> list[dict]:
 
     data = _read_json(ENGINE_PROFILES_PATH, [])
     profiles = externalize_profiles(data, "engine")
+    if not profiles:
+        settings = read_settings()
+        name = str(settings.get("translate_engine_name") or "").strip()
+        base_url = str(settings.get("translate_engine_base_url") or "").strip()
+        model = str(settings.get("translate_engine_model") or "").strip()
+        api_key = str(settings.get("translate_engine_api_key") or "").strip()
+        selected_id = str(settings.get("translate_selected_engine_id") or "").strip()
+        if name or base_url or model or api_key:
+            api_key_ref = api_key[4:].strip() if api_key.startswith("ref:") else ""
+            profiles = [
+                {
+                    "id": selected_id or name or "translate-engine",
+                    "name": name or selected_id or "Translate engine",
+                    "api_key_ref": api_key_ref,
+                    "base_url": base_url,
+                    "model": model,
+                    "temperature": str(settings.get("translate_engine_temperature") or "0.2"),
+                    "status": "",
+                }
+            ]
 
     default_by_id = {p["id"]: p for p in defaults}
     for profile in profiles:

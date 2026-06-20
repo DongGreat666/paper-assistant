@@ -4,6 +4,7 @@ Flow: Upload PDF -> Parse to Markdown (Marker) -> Translate sections (LLM) -> Do
 """
 
 import asyncio
+import json
 import uuid
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -44,7 +45,11 @@ from src.ui.pages.home_model_service import (
     start_edit_engine_action,
     test_profile,
 )
-from src.ui.pages.home_upload_service import save_upload, short_stem
+from src.ui.pages.home_upload_service import (
+    TRANSLATE_UPLOAD_DIR,
+    save_translation_upload,
+    short_stem,
+)
 from src.ui.state import UISettingsState
 
 
@@ -53,6 +58,10 @@ from src.ui.state import UISettingsState
 # ---------------------------------------------------------------------------
 
 _task_cancels: dict[str, list[bool]] = {}
+_last_upload: dict[str, str] = {}
+_LAST_UPLOAD_PATH = TRANSLATE_UPLOAD_DIR / ".translate_last_upload.json"
+TRANSLATE_SECTION_TIMEOUT_SECONDS = 60
+TRANSLATE_HEARTBEAT_SECONDS = 10
 
 
 def _new_cancel_token() -> str:
@@ -68,6 +77,37 @@ def _cancel_task(token: str):
 
 def _is_cancelled(token: str) -> bool:
     return _task_cancels.get(token, [True])[0]
+
+
+def _remember_upload(saved) -> None:
+    """Keep a server-side fallback for the upload event state."""
+    global _last_upload
+    _last_upload = {
+        "file_name": saved.safe_name,
+        "saved_path": str(saved.destination),
+        "folder_path": str(saved.folder),
+        "file_info": saved.file_info,
+    }
+    _LAST_UPLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _LAST_UPLOAD_PATH.write_text(
+        json.dumps(_last_upload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _load_remembered_upload() -> dict[str, str]:
+    if _last_upload.get("saved_path"):
+        return _last_upload
+    try:
+        data = json.loads(_LAST_UPLOAD_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    saved_path = str(data.get("saved_path", ""))
+    if not saved_path or not Path(saved_path).exists():
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
 
 
 def _translate_defaults() -> dict:
@@ -186,6 +226,11 @@ class TranslateState(rx.State):
         self.engine_name = value
 
     def open_engine_config(self):
+        self.saved_engines = load_engine_profiles()
+        if self.selected_engine_id and self.saved_engines:
+            updates = select_engine_action(self.saved_engines, self.selected_engine_id)
+            for k, v in updates.items():
+                setattr(self, k, v)
         self.show_engine_config = True
 
     def close_engine_config(self):
@@ -281,7 +326,8 @@ class TranslateState(rx.State):
     async def handle_upload(self, files: list[rx.UploadFile]):
         if not files:
             return
-        saved = await save_upload(files[0])
+        saved = await save_translation_upload(files[0])
+        _remember_upload(saved)
 
         # Migrate older caches that used the full filename stem as the folder.
         full_stem = Path(saved.safe_name).stem
@@ -340,11 +386,25 @@ class TranslateState(rx.State):
     @rx.event(background=True)
     async def parse_paper(self):
         # Snapshot all needed state under the lock
+        restored_from_upload = False
         async with self:
             saved_path = self.saved_path
             if not saved_path:
-                self.status_message = "请先上传文件。"
-                return
+                remembered = _load_remembered_upload()
+                saved_path = remembered.get("saved_path", "")
+                if saved_path:
+                    self.file_name = remembered.get("file_name", Path(saved_path).name)
+                    self.saved_path = saved_path
+                    self.folder_path = remembered.get("folder_path", str(Path(saved_path).parent))
+                    self.file_info = remembered.get("file_info", "")
+                    self.status_message = "已恢复刚上传的文件，开始解析。"
+                    restored_from_upload = True
+                else:
+                    self.status_message = "请先上传文件。"
+                    return
+
+        if restored_from_upload:
+            yield
 
         folder = Path(saved_path).parent
         stem = folder.name
@@ -493,11 +553,24 @@ class TranslateState(rx.State):
     @rx.event(background=True)
     async def translate_paper(self):
         # Snapshot all needed state under the lock
+        restored_from_upload = False
         async with self:
             folder_path = self.folder_path
             original_md = self.original_md
             translated_md = self.translated_md
             stem = Path(folder_path).name if folder_path else ""
+
+            if not folder_path:
+                remembered = _load_remembered_upload()
+                remembered_folder = remembered.get("folder_path", "")
+                if remembered_folder:
+                    self.file_name = remembered.get("file_name", Path(remembered.get("saved_path", "")).name)
+                    self.saved_path = remembered.get("saved_path", "")
+                    self.folder_path = remembered_folder
+                    self.file_info = remembered.get("file_info", "")
+                    folder_path = remembered_folder
+                    stem = Path(folder_path).name
+                    restored_from_upload = True
 
             if not original_md and folder_path:
                 md_path = Path(folder_path) / f"{stem}.md"
@@ -508,6 +581,12 @@ class TranslateState(rx.State):
             if not original_md:
                 self.status_message = "请先解析 PDF。"
                 return
+
+            if restored_from_upload:
+                self.status_message = "已恢复刚上传的文件，开始翻译。"
+
+        if restored_from_upload:
+            yield
 
         # Cached translation
         zh_path = Path(folder_path) / f"{stem}_zh.md"
@@ -529,10 +608,29 @@ class TranslateState(rx.State):
                 return
 
         token = _new_cancel_token()
+        progress_state = {"done": 0, "total": 0}
 
         async def on_progress(done: int, total: int):
+            progress_state["done"] = done
+            progress_state["total"] = total
             async with self:
                 self._log(f"翻译进度：{done}/{total}")
+                self.status_message = f"正在翻译 Markdown 文档：{done}/{total} 段完成。"
+
+        async def translation_heartbeat():
+            started = asyncio.get_event_loop().time()
+            while True:
+                await asyncio.sleep(TRANSLATE_HEARTBEAT_SECONDS)
+                elapsed = int(asyncio.get_event_loop().time() - started)
+                mins, secs = divmod(elapsed, 60)
+                done = progress_state.get("done", 0)
+                total = progress_state.get("total", 0)
+                async with self:
+                    if self.current_task_token != token or not self.is_translating:
+                        return
+                    suffix = f"{done}/{total} 段完成，" if total else ""
+                    self._log(f"翻译仍在运行：{suffix}已用时 {mins} 分 {secs} 秒")
+                    self.status_message = f"正在翻译：{suffix}已用时 {mins} 分 {secs} 秒。"
 
         try:
             async with self:
@@ -562,10 +660,26 @@ class TranslateState(rx.State):
             yield
 
             # Heavy translation work — runs outside the state lock
-            result = await translate_markdown(
-                original_md, engine=engine, on_progress=on_progress,
-                should_stop=lambda: _is_cancelled(token) or self.stop_requested,
-            )
+            total_sections = len(split_markdown_into_sections(original_md))
+            progress_state["total"] = total_sections
+            async with self:
+                self.status_message = f"正在翻译 Markdown 文档：0/{total_sections} 段完成。"
+            yield
+            heartbeat_task = asyncio.create_task(translation_heartbeat())
+            try:
+                result = await translate_markdown(
+                    original_md,
+                    engine=engine,
+                    on_progress=on_progress,
+                    should_stop=lambda: _is_cancelled(token) or self.stop_requested,
+                    task_timeout=TRANSLATE_SECTION_TIMEOUT_SECONDS,
+                )
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
             result_report = RepairReport()
             result = repair_markdown_code_fences(result)
             result = repair_heading_levels(result, result_report)
@@ -579,7 +693,6 @@ class TranslateState(rx.State):
 
             # Check if translation actually produced real content
             fail_count = result.count("<!-- 翻译失败") + result.count("<!-- 翻译超时")
-            total_sections = len(split_markdown_into_sections(original_md))
             if fail_count > 0 and fail_count >= total_sections:
                 async with self:
                     self.translated_md = ""
@@ -705,6 +818,45 @@ class TranslateState(rx.State):
         self.show_logs = False
         self.file_info = ""
         self.status_message = "上传 PDF 或 Markdown 文件，解析后点击「翻译」生成中文译文。"
+
+    def restore_recent_upload(self):
+        if self.saved_path or self.original_md or self.translated_md:
+            return
+        remembered = _load_remembered_upload()
+        saved_path = remembered.get("saved_path", "")
+        folder_path = remembered.get("folder_path", "")
+        if not saved_path or not folder_path:
+            return
+
+        self.file_name = remembered.get("file_name", Path(saved_path).name)
+        self.saved_path = saved_path
+        self.folder_path = folder_path
+        self.file_info = remembered.get("file_info", "")
+        self.translated_md = ""
+        self.translated_html = ""
+        self.current_task_token = ""
+        self.is_parsing = False
+        self.is_translating = False
+        self.stop_requested = False
+
+        path = Path(saved_path)
+        folder = Path(folder_path)
+        stem = folder.name
+        md_path = folder / f"{stem}.md"
+        if path.suffix.lower() == ".md":
+            md_path = path
+        if md_path.exists():
+            md_text = md_path.read_text(encoding="utf-8")
+            self.original_md = md_text
+            self.original_html = markdown_to_html(md_text)
+            self.progress_step = 2
+            self.status_message = "已恢复刚上传的文件。点击「翻译」开始翻译。"
+            self._log(f"已恢复：{self.file_name}")
+        else:
+            self.original_md = ""
+            self.original_html = ""
+            self.progress_step = 1
+            self.status_message = "已恢复刚上传的文件。点击「解析」开始解析。"
 
     def _build_engine(self) -> TranslationEngine:
         return build_engine(
@@ -900,46 +1052,12 @@ def control_bar() -> rx.Component:
 def markdown_preview(content: rx.Var[str], placeholder: str) -> rx.Component:
     return rx.cond(
         content != "",
-        rx.markdown(
+        rx.text(
             content,
-            component_map={
-                "p": lambda text: rx.text(
-                    text,
-                    font_size="calc(var(--base-font) * 0.9)",
-                    line_height="1.75",
-                    margin_bottom="0.75rem",
-                    color=UISettingsState.text_color,
-                ),
-                "li": lambda text: rx.list.item(
-                    text,
-                    font_size="calc(var(--base-font) * 0.9)",
-                    line_height="1.75",
-                    color=UISettingsState.text_color,
-                ),
-                "h1": lambda text: rx.heading(
-                    text,
-                    size="5",
-                    margin="0.8rem 0 0.6rem",
-                    color=UISettingsState.text_color,
-                ),
-                "h2": lambda text: rx.heading(
-                    text,
-                    size="4",
-                    margin="0.8rem 0 0.6rem",
-                    color=UISettingsState.text_color,
-                ),
-                "h3": lambda text: rx.heading(
-                    text,
-                    size="3",
-                    margin="0.7rem 0 0.5rem",
-                    color=UISettingsState.text_color,
-                ),
-                "code": lambda text: rx.code(
-                    text,
-                    white_space="pre-wrap",
-                    font_size="calc(var(--base-font) * 0.82)",
-                ),
-            },
+            white_space="pre-wrap",
+            font_size="calc(var(--base-font) * 0.9)",
+            line_height="1.75",
+            color=UISettingsState.text_color,
         ),
         rx.text(
             placeholder,
@@ -1164,9 +1282,12 @@ def engine_config_overlay() -> rx.Component:
     return rx.box(
         rx.box(
             engine_panel(),
-            width="min(760px, calc(100vw - 3rem))",
+            width="min(720px, calc(100vw - 2rem))",
+            max_width="720px",
             max_height="calc(100vh - 5rem)",
             overflow_y="auto",
+            overflow_x="hidden",
+            box_sizing="border-box",
         ),
         position="fixed",
         inset="0",
@@ -1174,7 +1295,7 @@ def engine_config_overlay() -> rx.Component:
         display="flex",
         align_items="center",
         justify_content="center",
-        padding="1.5rem",
+        padding="1rem",
         bg=rx.cond(UISettingsState.theme == "dark", "rgba(3, 7, 18, 0.62)", "rgba(15, 23, 42, 0.18)"),
         backdrop_filter="blur(2px)",
     )
@@ -1219,9 +1340,12 @@ def engine_panel() -> rx.Component:
                     size="1",
                     variant="soft",
                     on_click=TranslateState.start_new_engine,
+                    flex_shrink="0",
                 ),
                 width="100%",
                 spacing="2",
+                min_width="0",
+                wrap="wrap",
             ),
             rx.text("可保存多个 OpenAI 兼容引擎，点击修改进入配置。", font_size="calc(var(--base-font) * 0.78)", color=UISettingsState.muted_text_color, line_height="1.55"),
             rx.vstack(
@@ -1256,9 +1380,15 @@ def engine_panel() -> rx.Component:
             ),
             spacing="3",
             align_items="start",
+            width="100%",
+            max_width="100%",
+            min_width="0",
+            overflow_x="hidden",
         ),
         padding="1rem",
         width="100%",
+        max_width="100%",
+        overflow_x="hidden",
     )
 
 
@@ -1402,9 +1532,13 @@ def engine_card(profile) -> rx.Component:
                 spacing="1",
                 align="center",
                 padding_left="24px",
+                min_width="0",
+                wrap="wrap",
             ),
             spacing="1",
             width="100%",
+            min_width="0",
+            overflow_x="hidden",
         ),
         padding="0.5rem 0",
         border_radius="10px",
@@ -1426,6 +1560,10 @@ def engine_card(profile) -> rx.Component:
         _hover={"box_shadow": "0 2px 8px rgba(0, 0, 0, 0.08)"},
         transition="all 0.15s ease",
         width="100%",
+        max_width="100%",
+        min_width="0",
+        overflow_x="hidden",
+        box_sizing="border-box",
     )
 
 def engine_form() -> rx.Component:
@@ -1458,47 +1596,68 @@ def engine_form() -> rx.Component:
             _field("名称", TranslateState.engine_name, TranslateState.set_engine_name, "text", "DeepSeek 翻译"),
             _field("API Key", TranslateState.engine_api_key, TranslateState.set_engine_api_key, "password", "sk-..."),
             _field("Base URL", TranslateState.engine_base_url, TranslateState.set_engine_base_url, "text", "https://api.openai.com/v1"),
-            rx.grid(
+            rx.vstack(
                 _field("Model", TranslateState.engine_model, TranslateState.set_engine_model, "text", "gpt-4o-mini"),
                 _field("Temperature", TranslateState.engine_temperature, TranslateState.set_engine_temperature, "text", "0.3"),
-                columns="1fr 120px",
-                spacing="3",
+                spacing="2",
                 width="100%",
+                min_width="0",
             ),
             rx.hstack(
                 rx.button(
                     rx.icon(tag="x", size=14),
                     "取消",
                     on_click=TranslateState.cancel_edit,
-                    width="100%",
                     variant="soft",
                     color_scheme="gray",
+                    min_width="96px",
                 ),
                 rx.button(
                     rx.icon(tag="save", size=14),
                     "保存",
                     on_click=TranslateState.save_current_engine,
-                    width="100%",
+                    min_width="96px",
                 ),
                 spacing="2",
                 width="100%",
+                justify="end",
+                wrap="wrap",
+                min_width="0",
             ),
             spacing="2",
             width="100%",
             align_items="start",
+            min_width="0",
+            overflow_x="hidden",
         ),
         padding="0.75rem",
         border="1.5px solid #d0d7e2",
         border_radius="10px",
         bg=rx.cond(UISettingsState.theme == "dark", "#1e293b", "#f8fafc"),
         width="100%",
+        max_width="100%",
+        min_width="0",
+        overflow_x="hidden",
+        box_sizing="border-box",
     )
 
 def _field(label: str, value, on_change, input_type: str, placeholder: str) -> rx.Component:
     return rx.vstack(
         small_label(label),
-        rx.input(value=value, on_change=on_change, type=input_type, placeholder=placeholder, width="100%", size="2"),
+        rx.input(
+            value=value,
+            on_change=on_change,
+            type=input_type,
+            placeholder=placeholder,
+            width="100%",
+            max_width="100%",
+            min_width="0",
+            size="2",
+            box_sizing="border-box",
+        ),
         spacing="1",
         width="100%",
+        max_width="100%",
+        min_width="0",
         align_items="start",
     )

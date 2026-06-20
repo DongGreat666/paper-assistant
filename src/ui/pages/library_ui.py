@@ -174,7 +174,10 @@ window.__pdfBridge.on('library-page', function(msg) {
     }
     var pos = msg.highlight.position || {};
     var rects = pos.rects || [];
-    var page = pos.pageNumber || 0;
+    var page = pos.pageNumber ||
+      (pos.boundingRect && pos.boundingRect.pageNumber) ||
+      (rects[0] && rects[0].pageNumber) ||
+      0;
     document.getElementById('pdf-hl-id').value = msg.id || '';
     document.getElementById('pdf-hl-text').value = (msg.highlight.content && msg.highlight.content.text) || '';
     document.getElementById('pdf-hl-color').value = msg.color || '#FFD700';
@@ -198,7 +201,7 @@ window.__pdfBridge.on('library-page', function(msg) {
     document.getElementById('pdf-trans-mode').value = msg.mode || 'sidebar';
     document.getElementById('pdf-trans-trigger').click();
   }
-  if (msg.type === 'ANNOTATION_ADDED' && msg.comment) {
+  if (msg.type === 'ANNOTATION_ADDED') {
     document.getElementById('pdf-anno-id').value = msg.id || '';
     document.getElementById('pdf-anno-text').value = msg.text || '';
     document.getElementById('pdf-anno-comment').value = msg.comment || '';
@@ -1248,13 +1251,13 @@ def _notes_tab() -> rx.Component:
         rx.vstack(
             rx.vstack(
                 rx.text(
-                    "PDF 批注",
+                    "PDF 笔记",
                     font_size="calc(var(--base-font) * 1.05)",
                     font_weight="700",
                     color=UISettingsState.text_color,
                 ),
                 rx.text(
-                    "高亮、下划线、删除线和笔记",
+                    "高亮、下划线和笔记",
                     font_size="calc(var(--base-font) * 0.72)",
                     color=UISettingsState.muted_text_color,
                 ),
@@ -1379,7 +1382,7 @@ def activity_bar() -> rx.Component:
         _act_btn("circle_help", "chat", "问答"),
         _act_btn("cpu", "model", "模型"),
         _act_btn("languages", "translate", "翻译"),
-        _act_btn("notebook_pen", "notes", "批注"),
+        _act_btn("notebook_pen", "notes", "笔记"),
         display="flex",
         flex_direction="column",
         width="48px",
@@ -1510,22 +1513,19 @@ def right_content_panel() -> rx.Component:
         rx.cond(
             LibraryState.right_tab == "chat",
             _chat_tab(),
-            rx.box(),
-        ),
-        rx.cond(
-            LibraryState.right_tab == "notes",
-            _notes_tab(),
-            rx.box(),
-        ),
-        rx.cond(
-            LibraryState.right_tab == "translate",
-            _translate_tab(),
-            rx.box(),
-        ),
-        rx.cond(
-            LibraryState.right_tab == "model",
-            _model_tab(),
-            rx.box(),
+            rx.cond(
+                LibraryState.right_tab == "notes",
+                _notes_tab(),
+                rx.cond(
+                    LibraryState.right_tab == "translate",
+                    _translate_tab(),
+                    rx.cond(
+                        LibraryState.right_tab == "model",
+                        _model_tab(),
+                        rx.box(),
+                    ),
+                ),
+            ),
         ),
         id="right-content-panel",
         width=rx.cond(LibraryState.right_open, LibraryState.right_panel_width_css, "0px"),

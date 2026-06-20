@@ -35,6 +35,39 @@ from src.core.markdown_math import normalize_math_delimiters
 from config import get_config, read_settings
 
 UPLOAD_DIR = get_config().papers_dir.resolve()
+LAST_LIBRARY_PATH = Path("data") / "library_last_open.json"
+
+
+def _remember_library_state(title: str, folder: str, path: str, right_tab: str) -> None:
+    if not path:
+        return
+    try:
+        LAST_LIBRARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LAST_LIBRARY_PATH.write_text(
+            json.dumps(
+                {
+                    "title": title,
+                    "folder": folder,
+                    "path": path,
+                    "right_tab": right_tab,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _load_remembered_library_state() -> dict:
+    try:
+        if not LAST_LIBRARY_PATH.exists():
+            return {}
+        data = json.loads(LAST_LIBRARY_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 @dataclass
@@ -110,7 +143,7 @@ class LibraryState(rx.State):
 
     selected_paper: str = ""
     selected_folder: str = ""
-    selected_pdf_path: str = ""  # relative to uploaded_files/, e.g. "folder/paper.pdf"
+    selected_pdf_path: str = ""  # relative to the configured paper library root, e.g. "folder/paper.pdf"
     pdf_reader_url: str = ""
     note_text: str = ""
     chat_input: str = ""
@@ -157,7 +190,6 @@ class LibraryState(rx.State):
     annotations: list[dict] = []
     editing_annotation_id: str = ""
     editing_annotation_note: str = ""
-
     # Chat state
     chat_messages: list[dict] = []  # [{role, content}]
     chat_loading: bool = False
@@ -306,6 +338,23 @@ class LibraryState(rx.State):
             )
             for name, papers in sorted(tree.items())
         ]
+        if not self.selected_pdf_path:
+            remembered = _load_remembered_library_state()
+            path = str(remembered.get("path", ""))
+            safe_path = self._safe_pdf_path(path) if path else None
+            if safe_path is not None and safe_path.exists():
+                title = str(remembered.get("title") or safe_path.stem)
+                folder = str(remembered.get("folder") or safe_path.parent.name)
+                self.selected_paper = title
+                self.selected_folder = folder
+                self.selected_pdf_path = path
+                safe_folder = quote(folder)
+                safe_file = quote(path.split("/", 1)[1] if "/" in path else path)
+                self.pdf_reader_url = f"/pdf-reader/index.html?file=/api/pdf/{safe_folder}/{safe_file}"
+                self.right_open = True
+                self.right_tab = str(remembered.get("right_tab") or "chat")
+                self._load_annotations_from_pdf()
+                return self._load_and_send_highlights(delay_ms=2500)
 
     def _safe_name(self, name: str) -> str:
         name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name.strip())
@@ -571,6 +620,7 @@ class LibraryState(rx.State):
         if prefs.get("pref_show_chat_on_open", True):
             self.right_open = True
             self.right_tab = "chat"
+        _remember_library_state(self.selected_paper, self.selected_folder, self.selected_pdf_path, self.right_tab)
         # Load existing highlights from PDF into sidebar and send to iframe
         self._load_annotations_from_pdf()
         return self._load_and_send_highlights()
@@ -631,7 +681,41 @@ class LibraryState(rx.State):
             return None
         return pdf_path.parent / "note.md"
 
-    def _remove_note_entry(self, kind: str, text: str):
+    def _note_section_bounds(self, content: str) -> tuple[int, int] | None:
+        """Return the current paper's H1 section bounds inside note.md."""
+        title = (self.selected_paper or "").strip()
+        if not title:
+            return None
+        headings = list(re.finditer(r"(?m)^#\s+(.+?)\s*$", content))
+        for index, match in enumerate(headings):
+            if match.group(1).strip() == title:
+                end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+                return match.start(), end
+        return None
+
+    def _replace_note_section(self, section: str):
+        """Replace or append the current PDF title section in note.md."""
+        note_path = self._get_note_path()
+        if not note_path:
+            return
+        try:
+            content = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
+        except Exception:
+            content = ""
+        normalized = section.strip() + "\n"
+        bounds = self._note_section_bounds(content)
+        if bounds:
+            before = content[:bounds[0]].rstrip()
+            after = content[bounds[1]:].lstrip()
+            content = "\n\n".join(part for part in (before, normalized.strip(), after) if part).rstrip() + "\n"
+        else:
+            content = (content.rstrip() + "\n\n" if content.strip() else "") + normalized
+        try:
+            note_path.write_text(content, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _remove_note_entry(self, kind: str, text: str, annot_id: str = ""):
         """Remove a matching entry from note.md."""
         if not read_settings().get("pref_save_notes_to_paper_dir", True):
             return
@@ -639,9 +723,26 @@ class LibraryState(rx.State):
         if not note_path or not note_path.exists():
             return
         try:
-            lines = note_path.read_text(encoding="utf-8").splitlines(keepends=True)
+            content = note_path.read_text(encoding="utf-8")
         except Exception:
             return
+        bounds = self._note_section_bounds(content)
+        if not bounds:
+            return
+        section = content[bounds[0]:bounds[1]]
+
+        if annot_id:
+            marker = f"<!-- paper-assistant-annotation:{annot_id} -->"
+            if marker in section:
+                pattern = (
+                    rf"(?ms)^<!-- paper-assistant-annotation:{re.escape(annot_id)} -->\n"
+                    rf"- \*\*.*?(?=^<!-- paper-assistant-annotation:|^- \*\*|^# |\Z)"
+                )
+                new_section = re.sub(pattern, "", section).strip()
+                self._replace_note_section(new_section)
+                return
+
+        lines = section.splitlines(keepends=True)
         # Match line containing both the kind and text snippet
         snippet = text[:40] if text else ""
         new_lines = []
@@ -658,12 +759,9 @@ class LibraryState(rx.State):
                 skip_next = True  # also skip possible "> note" line after
                 continue
             new_lines.append(line)
-        try:
-            note_path.write_text("".join(new_lines), encoding="utf-8")
-        except Exception:
-            pass
+        self._replace_note_section("".join(new_lines))
 
-    def _append_note(self, kind: str, text: str, note: str = ""):
+    def _append_note(self, kind: str, text: str, note: str = "", annot_id: str = ""):
         """Append an entry to note.md in the PDF's folder."""
         if not read_settings().get("pref_save_notes_to_paper_dir", True):
             return
@@ -671,21 +769,19 @@ class LibraryState(rx.State):
         if not note_path:
             return
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        content = note or text
         entry = f"- **[{now}] {kind}**：{text}"
         if note:
             entry += f"\n  > {note}"
         entry += "\n"
+        if annot_id:
+            entry = f"<!-- paper-assistant-annotation:{annot_id} -->\n{entry}"
         try:
-            existing = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
+            content = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
         except Exception:
-            existing = ""
-        if not existing:
-            existing = f"# {self.selected_paper or '笔记'}\n\n"
-        try:
-            note_path.write_text(existing + entry, encoding="utf-8")
-        except Exception:
-            pass
+            content = ""
+        bounds = self._note_section_bounds(content)
+        section = content[bounds[0]:bounds[1]].rstrip() if bounds else f"# {self.selected_paper or '笔记'}"
+        self._replace_note_section(section + "\n\n" + entry)
 
     def _load_annotations_from_pdf(self):
         """Load existing PDF annotations into the sidebar list."""
@@ -700,25 +796,63 @@ class LibraryState(rx.State):
             "highlight": "高亮",
             "underline": "下划线",
             "strikethrough": "删除线",
-            "comment": "批注",
+            "comment": "笔记",
             "translation": "翻译",
         }
         loaded = []
         for h in raw:
             ann_type = h.get("_type", "highlight")
+            if ann_type not in kind_map:
+                continue
             text = h.get("content", {}).get("text", "")
             comment = h.get("comment", {})
             note = comment.get("text", "") if isinstance(comment, dict) else ""
-            trans = comment.get("translation", "") if isinstance(comment, dict) else ""
+            translation = comment.get("translation", "") if isinstance(comment, dict) else ""
+            display_text = text or note or translation
             loaded.append({
                 "id": h.get("id", ""),
-                "kind": "批注" if ann_type == "highlight" and note else kind_map.get(ann_type, "高亮"),
-                "text": text or trans,
+                "kind": "笔记" if ann_type == "highlight" and note else kind_map.get(ann_type, "高亮"),
+                "text": display_text,
                 "note": note,
                 "color": h.get("_color", ""),
                 "annotation_type": ann_type,
             })
         self.annotations = loaded
+
+    def _annotation_payload_from_pdf(self, annot_id: str) -> dict | None:
+        """Find an annotation by id in the selected PDF for note cleanup."""
+        if not annot_id:
+            return None
+        pdf_path = self._selected_pdf_file()
+        if pdf_path is None:
+            return None
+        try:
+            raw = read_highlights(str(pdf_path))
+        except Exception:
+            return None
+        kind_map = {
+            "highlight": "高亮",
+            "underline": "下划线",
+            "strikethrough": "删除线",
+            "comment": "笔记",
+            "translation": "翻译",
+        }
+        for item in raw:
+            if item.get("id") != annot_id:
+                continue
+            ann_type = item.get("_type", "highlight")
+            comment = item.get("comment", {})
+            note = comment.get("text", "") if isinstance(comment, dict) else ""
+            translation = comment.get("translation", "") if isinstance(comment, dict) else ""
+            text = item.get("content", {}).get("text", "") or note or translation
+            return {
+                "id": annot_id,
+                "kind": "笔记" if ann_type == "highlight" and note else kind_map.get(ann_type, "高亮"),
+                "text": text,
+                "note": note,
+                "annotation_type": ann_type,
+            }
+        return None
 
     def _load_and_send_highlights(self, delay_ms: int = 1500):
         """Read highlights from PDF and send to iframe without reloading it."""
@@ -980,34 +1114,28 @@ class LibraryState(rx.State):
         self.note_text = text
 
     def set_right_tab(self, tab: str):
-        """Switch right panel tab. Toggle off if same tab clicked again."""
+        """Switch or open the right panel tab.
+
+        Activity-bar buttons should be stable navigation targets. Closing is
+        handled by the panel edge toggle, so clicking the active tab again keeps
+        the panel open instead of making the right side appear to disappear.
+        """
         if tab == "model" and not self.engine_profiles:
             self.load_engines()
-        if self.right_open and self.right_tab == tab:
-            self.right_open = False
-            # Disable auto-translate when closing
-            return rx.call_script(
-                """(function() {
-                  var iframe = document.querySelector('iframe[src*="pdf-reader"]');
-                  if (iframe && iframe.contentWindow) {
-                    iframe.contentWindow.postMessage({type: 'AUTO_TRANSLATE', enabled: false}, window.location.origin);
-                  }
-                })()"""
-            )
-        else:
-            self.right_tab = tab
-            self.right_open = True
-            # Enable auto-translate when translate tab is active and preference is on
-            auto_ok = read_settings().get("pref_auto_translate", True)
-            enabled = "true" if tab == "translate" and auto_ok else "false"
-            return rx.call_script(
-                f"""(function() {{
-                  var iframe = document.querySelector('iframe[src*="pdf-reader"]');
-                  if (iframe && iframe.contentWindow) {{
-                    iframe.contentWindow.postMessage({{type: 'AUTO_TRANSLATE', enabled: {enabled}}}, window.location.origin);
-                  }}
-                }})()"""
-            )
+        self.right_tab = tab
+        self.right_open = True
+        _remember_library_state(self.selected_paper, self.selected_folder, self.selected_pdf_path, self.right_tab)
+        # Enable auto-translate when translate tab is active and preference is on
+        auto_ok = read_settings().get("pref_auto_translate", True)
+        enabled = "true" if tab == "translate" and auto_ok else "false"
+        return rx.call_script(
+            f"""(function() {{
+              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+              if (iframe && iframe.contentWindow) {{
+                iframe.contentWindow.postMessage({{type: 'AUTO_TRANSLATE', enabled: {enabled}}}, window.location.origin);
+              }}
+            }})()"""
+        )
 
     def set_chat_input(self, text: str):
         self.chat_input = text
@@ -1015,13 +1143,14 @@ class LibraryState(rx.State):
     def save_note(self):
         if self.note_text.strip() and self.selected_text.strip():
             note_content = self.note_text.strip()
+            note_id = str(uuid.uuid4())[:8]
             self.annotations = [{
-                "id": str(uuid.uuid4())[:8],
+                "id": note_id,
                 "kind": "笔记",
                 "text": self.selected_text,
                 "note": note_content,
             }] + list(self.annotations)
-            self._append_note("笔记", self.selected_text, note_content)
+            self._append_note("笔记", self.selected_text, note_content, note_id)
         self.note_text = ""
 
     def clear_chat(self):
@@ -1299,63 +1428,55 @@ class LibraryState(rx.State):
             page: 1-based page number.
             annotation_type: "highlight" or "underline".
         """
-        self.right_open = True
-        self.right_tab = "notes"
         annotation_id = id or str(uuid.uuid4())[:8]
-        if any(a.get("id") == annotation_id for a in self.annotations):
+        add_to_notes = annotation_type in ("highlight", "underline")
+        if add_to_notes and any(a.get("id") == annotation_id for a in self.annotations):
             return
         kind = "下划线" if annotation_type == "underline" else "删除线" if annotation_type == "strikethrough" else "高亮"
-        anno = {
-            "id": annotation_id,
-            "kind": kind,
-            "text": text,
-            "note": "",
-            "color": color,
-            "annotation_type": annotation_type,
-        }
-        self.annotations = [anno] + list(self.annotations)
-        self._append_note(kind, text)
+        if add_to_notes:
+            self.right_open = True
+            self.right_tab = "notes"
+            _remember_library_state(self.selected_paper, self.selected_folder, self.selected_pdf_path, self.right_tab)
+            anno = {
+                "id": annotation_id,
+                "kind": kind,
+                "text": text,
+                "note": "",
+                "color": color,
+                "annotation_type": annotation_type,
+            }
+            self.annotations = [anno] + list(self.annotations)
+            self._append_note(kind, text, annot_id=annotation_id)
         # Write to PDF file
+        saved = False
         pdf_path = self._selected_pdf_file()
         if pdf_path and rects and page:
             try:
-                parsed_rects = json.loads(rects)
-                # Rects from react-pdf-highlighter are in rendered page coordinates.
-                # width/height fields = rendered page dimensions at current zoom.
-                # Convert to relative 0-1 by dividing by rendered dimensions.
-                converted = []
-                for r in parsed_rects:
-                    rw = r.get("width", 0) or 1
-                    rh = r.get("height", 0) or 1
-                    converted.append({
-                        "x1": r.get("x1", 0) / rw,
-                        "y1": r.get("y1", 0) / rh,
-                        "x2": r.get("x2", 0) / rw,
-                        "y2": r.get("y2", 0) / rh,
-                    })
+                converted = self._normalize_reader_rects(json.loads(rects))
+                source_page = int(converted[0].get("pageNumber") or page)
 
                 if annotation_type == "underline":
-                    add_underline(
+                    saved = add_underline(
                         str(pdf_path),
-                        page_num=page,
+                        page_num=source_page,
                         rects=converted,
                         color_hex=color,
                         highlight_id=annotation_id,
                         text=text,
                     )
                 elif annotation_type == "strikethrough":
-                    add_strikethrough(
+                    saved = add_strikethrough(
                         str(pdf_path),
-                        page_num=page,
+                        page_num=source_page,
                         rects=converted,
                         color_hex=color,
                         highlight_id=annotation_id,
                         text=text,
                     )
                 else:
-                    add_highlight(
+                    saved = add_highlight(
                         str(pdf_path),
-                        page_num=page,
+                        page_num=source_page,
                         rects=converted,
                         color_hex=color,
                         highlight_id=annotation_id,
@@ -1363,30 +1484,72 @@ class LibraryState(rx.State):
                     )
             except Exception as e:
                 logger.warning(f"Failed to write highlight to PDF: {e}")
-        return self._load_and_send_highlights(delay_ms=250)
+        if not saved and add_to_notes:
+            self.annotations = [a for a in self.annotations if a.get("id") != annotation_id]
+            self._remove_note_entry(kind, text, annotation_id)
+        sync_type = "HIGHLIGHT_SYNCED" if saved else "HIGHLIGHT_SYNC_FAILED"
+        return rx.call_script(
+            f"""(function() {{
+              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+              if (iframe && iframe.contentWindow) {{
+                iframe.contentWindow.postMessage({{type: {json.dumps(sync_type)}, id: {json.dumps(annotation_id)}}}, window.location.origin);
+              }}
+            }})()"""
+        )
 
     def handle_highlight_deleted(self, id: str):
         """Handle a highlight deleted in the PDF reader."""
+        success = False
+        target = next((a for a in self.annotations if a.get("id") == id), None)
+        if target is None:
+            target = self._annotation_payload_from_pdf(id)
+        if target:
+            self._remove_note_entry(target.get("kind", ""), target.get("text", ""), id)
         self.annotations = [a for a in self.annotations if a.get("id") != id]
+        self.right_open = True
+        self.right_tab = "notes"
+        _remember_library_state(self.selected_paper, self.selected_folder, self.selected_pdf_path, self.right_tab)
         # Delete from PDF file — single annotation per id
         pdf_path = self._selected_pdf_file()
         if pdf_path and id:
             try:
-                delete_highlight(str(pdf_path), id)
+                success = delete_highlight(str(pdf_path), id)
+                if success:
+                    self._load_annotations_from_pdf()
+                else:
+                    success = not any(h.get("id") == id for h in read_highlights(str(pdf_path)))
             except Exception as e:
                 logger.warning(f"Failed to delete highlight from PDF: {e}")
+        return rx.call_script(
+            f"""(function() {{
+              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+              if (iframe && iframe.contentWindow) {{
+                iframe.contentWindow.postMessage({{
+                  type: 'HIGHLIGHT_DELETE_SYNCED',
+                  id: {json.dumps(id)},
+                  success: {json.dumps(success)}
+                }}, window.location.origin);
+              }}
+            }})()"""
+        )
 
     def delete_annotation(self, id: str):
         """Delete an annotation from the right panel — also removes from PDF, note.md, and iframe."""
         # Find the annotation to get kind/text for note.md removal
         target = next((a for a in self.annotations if a.get("id") == id), None)
+        if target is None:
+            target = self._annotation_payload_from_pdf(id)
         if target:
-            self._remove_note_entry(target.get("kind", ""), target.get("text", ""))
+            self._remove_note_entry(target.get("kind", ""), target.get("text", ""), id)
         self.annotations = [a for a in self.annotations if a.get("id") != id]
+        self.right_open = True
+        self.right_tab = "notes"
+        _remember_library_state(self.selected_paper, self.selected_folder, self.selected_pdf_path, self.right_tab)
         pdf_path = self._selected_pdf_file()
         if pdf_path and id:
             try:
-                delete_highlight(str(pdf_path), id)
+                if delete_highlight(str(pdf_path), id):
+                    self._load_annotations_from_pdf()
             except Exception as e:
                 logger.warning(f"Failed to delete annotation from PDF: {e}")
         return rx.call_script(
@@ -1436,8 +1599,8 @@ class LibraryState(rx.State):
                 logger.warning(f"Failed to update annotation comment in PDF: {e}")
 
         if old_note != note:
-            self._remove_note_entry(target.get("kind", ""), target.get("text", ""))
-            self._append_note(target.get("kind", "批注"), target.get("text", ""), note)
+            self._remove_note_entry(target.get("kind", ""), target.get("text", ""), annot_id)
+            self._append_note(target.get("kind", "笔记"), target.get("text", ""), note, annot_id)
 
         self.cancel_edit_annotation()
         return rx.call_script(
@@ -1558,17 +1721,6 @@ class LibraryState(rx.State):
         except Exception as e:
             logger.warning(f"Failed to save translation to PDF: {e}")
 
-        # Add to annotations list
-        anno = {
-            "id": id,
-            "kind": "翻译",
-            "text": text[:80],
-            "note": translation,
-            "annotation_type": "translation",
-        }
-        self.annotations = [anno] + list(self.annotations)
-        self._append_note("翻译", text[:80], translation)
-
         # Update the highlight in the iframe without full reload
         annotation_id = json.dumps(id)
         trans_json = json.dumps(translation)
@@ -1599,7 +1751,6 @@ class LibraryState(rx.State):
                 )
         except Exception as e:
             logger.warning(f"Failed to move freetext annotation: {e}")
-        return self._load_and_send_highlights(delay_ms=250)
 
     def pin_translation(self, id: str, text: str, result: str, rects: str = "", page: int = 0):
         """Pin a floating translation to the right panel Translate tab."""
@@ -1689,31 +1840,44 @@ class LibraryState(rx.State):
         """
         self.right_open = True
         self.right_tab = "notes"
+        _remember_library_state(self.selected_paper, self.selected_folder, self.selected_pdf_path, self.right_tab)
         anno = {
             "id": id or str(uuid.uuid4())[:8],
-            "kind": "批注",
+            "kind": "笔记",
             "text": text,
             "note": comment,
         }
         self.annotations = [anno] + list(self.annotations)
-        self._append_note("批注", text, comment)
+        self._append_note("笔记", text, comment, anno["id"])
         # Store the user's note on the PDF highlight itself so PDF readers show it on hover.
+        saved = False
         pdf_path = self._selected_pdf_file()
         if pdf_path and rects and page:
             try:
                 parsed_rects = self._normalize_reader_rects(json.loads(rects))
                 source_page = int(parsed_rects[0].get("pageNumber") or page)
-                add_highlight(
+                saved = add_highlight(
                     str(pdf_path),
                     page_num=source_page,
                     rects=parsed_rects,
                     color_hex="#FFD700",
-                    highlight_id=id,
+                    highlight_id=anno["id"],
                     text=comment,
                 )
             except Exception as e:
                 logger.warning(f"Failed to add annotation to PDF: {e}")
-        return self._load_and_send_highlights(delay_ms=250)
+        if not saved:
+            self.annotations = [a for a in self.annotations if a.get("id") != anno["id"]]
+            self._remove_note_entry("笔记", text, anno["id"])
+        sync_type = "HIGHLIGHT_SYNCED" if saved else "HIGHLIGHT_SYNC_FAILED"
+        return rx.call_script(
+            f"""(function() {{
+              var iframe = document.querySelector('iframe[src*="pdf-reader"]');
+              if (iframe && iframe.contentWindow) {{
+                iframe.contentWindow.postMessage({{type: {json.dumps(sync_type)}, id: {json.dumps(anno["id"])}}}, window.location.origin);
+              }}
+            }})()"""
+        )
 
     async def translate_selection(self):
         """Translate the selected text using the configured engine."""

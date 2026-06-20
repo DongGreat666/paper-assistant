@@ -13,6 +13,8 @@ from src.core.document_parser import parse_docx_to_markdown
 
 PAPERS_DIR = get_config().papers_dir.resolve()
 CHAT_UPLOAD_DIR = (get_config().data_dir / "chat_uploads").resolve()
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+TRANSLATE_UPLOAD_DIR = (PROJECT_ROOT / "paper_translation").resolve()
 MAX_PDF_CONTEXT_CHARS = 60000
 MAX_IMAGE_SIDE = 2000
 
@@ -96,6 +98,11 @@ def extract_pdf_text_fast(pdf_path: str | Path, max_chars: int = MAX_PDF_CONTEXT
 async def save_upload(upload: Any) -> SavedUpload:
     """Save an upload permanently for workflows such as full translation."""
     return await _save_upload_to(upload, PAPERS_DIR)
+
+
+async def save_translation_upload(upload: Any) -> SavedUpload:
+    """Save a full-paper translation upload in the translation workspace."""
+    return await _save_upload_to(upload, TRANSLATE_UPLOAD_DIR)
 
 
 async def save_chat_upload(upload: Any) -> SavedUpload:
