@@ -5,9 +5,10 @@ Flow: Upload PDF -> Parse to Markdown (Marker) -> Translate sections (LLM) -> Do
 
 import asyncio
 import json
+import re
 import uuid
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import reflex as rx
 
@@ -19,6 +20,7 @@ from src.core.document_parser import (
 )
 from src.core.engine import (
     TranslationEngine,
+    api_key_display,
     build_engine,
     get_default_translation_engine,
     has_usable_api_key,
@@ -30,6 +32,8 @@ from src.core.exporter import (
     markdown_to_pdf,
     repair_markdown_code_fences,
 )
+from src.core.markdown_math import normalize_math_delimiters
+from src.core.markdown_links import normalize_escaped_brackets_in_link_labels
 from src.core.markdown_repair import RepairReport, repair_heading_levels, repair_marker_markdown
 from src.core.translator import (
     markdown_to_html,
@@ -46,7 +50,6 @@ from src.ui.pages.home_model_service import (
     test_profile,
 )
 from src.ui.pages.home_upload_service import (
-    TRANSLATE_UPLOAD_DIR,
     save_translation_upload,
     short_stem,
 )
@@ -58,10 +61,9 @@ from src.ui.state import UISettingsState
 # ---------------------------------------------------------------------------
 
 _task_cancels: dict[str, list[bool]] = {}
-_last_upload: dict[str, str] = {}
-_LAST_UPLOAD_PATH = TRANSLATE_UPLOAD_DIR / ".translate_last_upload.json"
 TRANSLATE_SECTION_TIMEOUT_SECONDS = 60
 TRANSLATE_HEARTBEAT_SECONDS = 10
+_MARKDOWN_IMAGE_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
 
 
 def _new_cancel_token() -> str:
@@ -79,35 +81,43 @@ def _is_cancelled(token: str) -> bool:
     return _task_cancels.get(token, [True])[0]
 
 
-def _remember_upload(saved) -> None:
-    """Keep a server-side fallback for the upload event state."""
-    global _last_upload
-    _last_upload = {
-        "file_name": saved.safe_name,
-        "saved_path": str(saved.destination),
-        "folder_path": str(saved.folder),
-        "file_info": saved.file_info,
-    }
-    _LAST_UPLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _LAST_UPLOAD_PATH.write_text(
-        json.dumps(_last_upload, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
-def _load_remembered_upload() -> dict[str, str]:
-    if _last_upload.get("saved_path"):
-        return _last_upload
+def _runtime_api_url() -> str:
+    """Read the active Reflex backend URL generated for the current run."""
+    env_path = Path(__file__).resolve().parent.parent.parent.parent / ".web" / "env.json"
     try:
-        data = json.loads(_LAST_UPLOAD_PATH.read_text(encoding="utf-8-sig"))
+        runtime_env = json.loads(env_path.read_text(encoding="utf-8"))
+        ping_url = str(runtime_env.get("PING", ""))
+        parsed = urlparse(ping_url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
     except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    saved_path = str(data.get("saved_path", ""))
-    if not saved_path or not Path(saved_path).exists():
-        return {}
-    return {str(k): str(v) for k, v in data.items()}
+        pass
+    return "http://localhost:8000"
+
+
+def _markdown_for_preview(md_text: str, folder_path: str) -> str:
+    """Prepare Markdown for display and route local images through the backend."""
+    normalized_math = normalize_math_delimiters(md_text)
+    displayed = format_markdown_for_display(normalized_math)
+    if not displayed or not folder_path:
+        return displayed
+
+    folder_name = Path(folder_path).name
+
+    def replace_image(match: re.Match[str]) -> str:
+        raw_target = match.group(2).strip()
+        target = raw_target[1:-1] if raw_target.startswith("<") and raw_target.endswith(">") else raw_target
+        parsed = urlparse(target)
+        if parsed.scheme or target.startswith(("/", "#", "data:")):
+            return match.group(0)
+        relative_path = unquote(parsed.path).replace("\\", "/").lstrip("./")
+        if not relative_path:
+            return match.group(0)
+        asset_path = quote(f"{folder_name}/{relative_path}", safe="/")
+        asset_url = f"{_runtime_api_url()}/api/translation-asset/{asset_path}"
+        return f"{match.group(1)}{asset_url}{match.group(3)}"
+
+    return _MARKDOWN_IMAGE_RE.sub(replace_image, displayed)
 
 
 def _translate_defaults() -> dict:
@@ -132,9 +142,20 @@ def _persist_translate_engine(
     engine_name: str,
 ) -> None:
     """Persist translate engine selection to settings file."""
+    persisted_key = engine_api_key
+    selected_profile = next(
+        (
+            profile
+            for profile in load_engine_profiles()
+            if profile.get("id") == selected_engine_id
+        ),
+        None,
+    )
+    if selected_profile:
+        persisted_key = api_key_display(selected_profile)
     write_settings({
         "translate_selected_engine_id": selected_engine_id,
-        "translate_engine_api_key": engine_api_key,
+        "translate_engine_api_key": persisted_key,
         "translate_engine_base_url": engine_base_url,
         "translate_engine_model": engine_model,
         "translate_engine_temperature": engine_temperature,
@@ -156,6 +177,50 @@ def _missing_markdown_images(md_text: str, folder: Path) -> list[str]:
         if local_ref and not (folder / local_ref).exists():
             missing.append(ref)
     return missing
+
+
+def _candidate_original_markdown_paths(folder: Path, stem: str, source_name: str = "") -> list[Path]:
+    """Return possible original Markdown cache paths for a translation folder."""
+    candidates: list[Path] = [folder / f"{stem}.md"]
+    if source_name:
+        candidates.append(folder / f"{Path(source_name).stem}.md")
+    for path in sorted(folder.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if path.name.endswith("_zh.md"):
+            continue
+        if path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
+def _load_folder_cache(folder: Path, stem: str, source_name: str = "") -> tuple[str, str]:
+    """Load valid parse/translation caches for the current upload folder only."""
+    original_path = next(
+        (path for path in _candidate_original_markdown_paths(folder, stem, source_name) if path.is_file()),
+        None,
+    )
+    if original_path is None:
+        return "", ""
+
+    original_md = normalize_escaped_brackets_in_link_labels(
+        original_path.read_text(encoding="utf-8")
+    )
+    original_path.write_text(original_md, encoding="utf-8")
+    canonical_original_path = folder / f"{stem}.md"
+    if original_path != canonical_original_path and not canonical_original_path.exists():
+        canonical_original_path.write_text(original_md, encoding="utf-8")
+    if _missing_markdown_images(original_md, folder):
+        return "", ""
+
+    translated_candidates = [folder / f"{stem}_zh.md"]
+    if source_name:
+        translated_candidates.append(folder / f"{Path(source_name).stem}_zh.md")
+    translated_path = next((path for path in translated_candidates if path.is_file()), None)
+    translated_md = (
+        translated_path.read_text(encoding="utf-8")
+        if translated_path is not None
+        else ""
+    )
+    return original_md, translated_md
 
 
 class TranslateState(rx.State):
@@ -190,8 +255,8 @@ class TranslateState(rx.State):
         total = max(len(original_sections), len(translated_sections))
         return [
             {
-                "original": format_markdown_for_display(original_sections[i]) if i < len(original_sections) else "",
-                "translated": format_markdown_for_display(translated_sections[i]) if i < len(translated_sections) else "",
+                "original": _markdown_for_preview(original_sections[i], self.folder_path) if i < len(original_sections) else "",
+                "translated": _markdown_for_preview(translated_sections[i], self.folder_path) if i < len(translated_sections) else "",
             }
             for i in range(total)
         ]
@@ -319,37 +384,20 @@ class TranslateState(rx.State):
                 {**p, "status": "fail"} if p.get("id") == profile_id else p
                 for p in self.saved_engines
             ]
-            self._log(f"引擎 [{profile.get('name', profile_id)}] 连接失败：{exc}")
+            detail = str(exc).strip() or type(exc).__name__
+            self._log(f"引擎 [{profile.get('name', profile_id)}] 连接失败：{detail}")
 
     # --- PDF Upload / Parse / Translate ---
 
     async def handle_upload(self, files: list[rx.UploadFile]):
         if not files:
             return
-        saved = await save_translation_upload(files[0])
-        _remember_upload(saved)
-
-        # Migrate older caches that used the full filename stem as the folder.
-        full_stem = Path(saved.safe_name).stem
-        if full_stem != saved.stem:
-            old_folder = saved.folder.parent / full_stem
-            if old_folder.is_dir():
-                import shutil
-
-                for item in old_folder.iterdir():
-                    if item.suffix.lower() not in {".md", ".json", ".png", ".jpg", ".jpeg", ".webp"}:
-                        continue
-                    if item.name.startswith(full_stem) and item.suffix.lower() == ".md":
-                        target_name = item.name.replace(full_stem, saved.stem, 1)
-                    else:
-                        target_name = item.name
-                    target = saved.folder / target_name
-                    if not target.exists():
-                        shutil.move(str(item), str(target))
-                try:
-                    old_folder.rmdir()
-                except OSError:
-                    pass
+        try:
+            saved = await save_translation_upload(files[0])
+        except (OSError, UnicodeError) as exc:
+            self.status_message = f"上传失败：{exc}"
+            self._log(self.status_message)
+            return
 
         self.file_name = saved.safe_name
         self.saved_path = str(saved.destination)
@@ -366,48 +414,70 @@ class TranslateState(rx.State):
         self.stop_requested = False
 
         if saved.suffix == ".md":
-            md_text = saved.data.decode("utf-8")
+            md_text = normalize_escaped_brackets_in_link_labels(
+                saved.data.decode("utf-8")
+            )
             fixed_path = saved.folder / f"{saved.stem}.md"
             fixed_path.write_text(md_text, encoding="utf-8")
             self.original_md = md_text
             self.original_html = markdown_to_html(md_text)
-            self.translated_html = ""
-            self.progress_step = 2
+            translated_path = saved.folder / f"{saved.stem}_zh.md"
+            if translated_path.is_file():
+                self.translated_md = translated_path.read_text(encoding="utf-8")
+                self.translated_html = markdown_to_html(self.translated_md)
+                self.progress_step = 3
+                self.status_message = "已加载本次文件及当前文件夹中的译文缓存。"
+            else:
+                self.translated_md = ""
+                self.translated_html = ""
+                self.progress_step = 2
+                self.status_message = "已加载本次 Markdown，点击「翻译」开始翻译。"
             self._log(f"已上传：{saved.safe_name}")
-            self.status_message = "点击「翻译」开始翻译。"
         else:
-            self.original_md = ""
-            self.original_html = ""
-            self.translated_html = ""
-            self.progress_step = 1
             self._log(f"已上传：{saved.safe_name}")
-            self.status_message = "点击「解析」按钮开始解析。"
+            cached_original, cached_translation = _load_folder_cache(
+                saved.folder,
+                saved.stem,
+                saved.safe_name,
+            )
+            if cached_original:
+                self.original_md = cached_original
+                self.original_html = markdown_to_html(cached_original)
+                self.translated_md = cached_translation
+                self.translated_html = (
+                    markdown_to_html(cached_translation)
+                    if cached_translation
+                    else ""
+                )
+                self.progress_step = 3 if cached_translation else 2
+                if cached_translation:
+                    self.status_message = "已加载本次文件夹中的解析结果和译文缓存。"
+                    self._log("已加载当前文件夹缓存：原文 Markdown、中文译文")
+                else:
+                    self.status_message = "已加载本次文件夹中的解析结果，点击「翻译」开始翻译。"
+                    self._log("已加载当前文件夹缓存：原文 Markdown")
+            else:
+                self.original_md = ""
+                self.original_html = ""
+                self.translated_md = ""
+                self.translated_html = ""
+                self.progress_step = 1
+                self.status_message = "本次文件没有可用缓存，点击「解析」开始解析。"
 
     @rx.event(background=True)
     async def parse_paper(self):
         # Snapshot all needed state under the lock
-        restored_from_upload = False
         async with self:
             saved_path = self.saved_path
-            if not saved_path:
-                remembered = _load_remembered_upload()
-                saved_path = remembered.get("saved_path", "")
-                if saved_path:
-                    self.file_name = remembered.get("file_name", Path(saved_path).name)
-                    self.saved_path = saved_path
-                    self.folder_path = remembered.get("folder_path", str(Path(saved_path).parent))
-                    self.file_info = remembered.get("file_info", "")
-                    self.status_message = "已恢复刚上传的文件，开始解析。"
-                    restored_from_upload = True
-                else:
-                    self.status_message = "请先上传文件。"
-                    return
-
-        if restored_from_upload:
-            yield
+            if not saved_path or not Path(saved_path).is_file():
+                self.saved_path = ""
+                self.status_message = "本次上传尚未完成或文件已不存在，请重新上传。"
+                self._log("解析未开始：没有可用的本次上传文件。")
+                return
 
         folder = Path(saved_path).parent
         stem = folder.name
+        source_name = Path(saved_path).name
 
         # Fast path: .md file — no heavy work, lock only for state writes
         if Path(saved_path).suffix.lower() == ".md":
@@ -426,11 +496,21 @@ class TranslateState(rx.State):
             return
 
         # Fast path: cached .md with all images
-        md_path = folder / f"{stem}.md"
-        if md_path.exists():
+        md_path = next(
+            (
+                path
+                for path in _candidate_original_markdown_paths(folder, stem, source_name)
+                if path.exists()
+            ),
+            None,
+        )
+        if md_path is not None:
             cached_md = md_path.read_text(encoding="utf-8")
             missing_imgs = _missing_markdown_images(cached_md, folder)
             if not missing_imgs:
+                canonical_md_path = folder / f"{stem}.md"
+                if md_path != canonical_md_path and not canonical_md_path.exists():
+                    canonical_md_path.write_text(cached_md, encoding="utf-8")
                 html = markdown_to_html(cached_md)
                 async with self:
                     self.original_md = cached_md
@@ -553,7 +633,6 @@ class TranslateState(rx.State):
     @rx.event(background=True)
     async def translate_paper(self):
         # Snapshot all needed state under the lock
-        restored_from_upload = False
         async with self:
             folder_path = self.folder_path
             original_md = self.original_md
@@ -561,32 +640,30 @@ class TranslateState(rx.State):
             stem = Path(folder_path).name if folder_path else ""
 
             if not folder_path:
-                remembered = _load_remembered_upload()
-                remembered_folder = remembered.get("folder_path", "")
-                if remembered_folder:
-                    self.file_name = remembered.get("file_name", Path(remembered.get("saved_path", "")).name)
-                    self.saved_path = remembered.get("saved_path", "")
-                    self.folder_path = remembered_folder
-                    self.file_info = remembered.get("file_info", "")
-                    folder_path = remembered_folder
-                    stem = Path(folder_path).name
-                    restored_from_upload = True
+                self.status_message = "请先上传并解析本次文件。"
+                return
 
             if not original_md and folder_path:
-                md_path = Path(folder_path) / f"{stem}.md"
-                if md_path.exists():
+                source_name = Path(self.saved_path).name if self.saved_path else ""
+                md_path = next(
+                    (
+                        path
+                        for path in _candidate_original_markdown_paths(
+                            Path(folder_path),
+                            stem,
+                            source_name,
+                        )
+                        if path.exists()
+                    ),
+                    None,
+                )
+                if md_path is not None:
                     original_md = md_path.read_text(encoding="utf-8")
                     self.original_md = original_md
                     self._log("已从磁盘加载原文 Markdown。")
             if not original_md:
                 self.status_message = "请先解析 PDF。"
                 return
-
-            if restored_from_upload:
-                self.status_message = "已恢复刚上传的文件，开始翻译。"
-
-        if restored_from_upload:
-            yield
 
         # Cached translation
         zh_path = Path(folder_path) / f"{stem}_zh.md"
@@ -783,8 +860,13 @@ class TranslateState(rx.State):
     def open_folder(self):
         if not self.folder_path:
             return
+        folder = Path(self.folder_path)
+        if not folder.is_dir():
+            self.status_message = "文件夹已不存在，请重新上传。"
+            self._log(self.status_message)
+            return
         import os
-        os.startfile(self.folder_path)
+        os.startfile(folder)
 
     async def stop_action(self):
         token = self.current_task_token
@@ -818,45 +900,6 @@ class TranslateState(rx.State):
         self.show_logs = False
         self.file_info = ""
         self.status_message = "上传 PDF 或 Markdown 文件，解析后点击「翻译」生成中文译文。"
-
-    def restore_recent_upload(self):
-        if self.saved_path or self.original_md or self.translated_md:
-            return
-        remembered = _load_remembered_upload()
-        saved_path = remembered.get("saved_path", "")
-        folder_path = remembered.get("folder_path", "")
-        if not saved_path or not folder_path:
-            return
-
-        self.file_name = remembered.get("file_name", Path(saved_path).name)
-        self.saved_path = saved_path
-        self.folder_path = folder_path
-        self.file_info = remembered.get("file_info", "")
-        self.translated_md = ""
-        self.translated_html = ""
-        self.current_task_token = ""
-        self.is_parsing = False
-        self.is_translating = False
-        self.stop_requested = False
-
-        path = Path(saved_path)
-        folder = Path(folder_path)
-        stem = folder.name
-        md_path = folder / f"{stem}.md"
-        if path.suffix.lower() == ".md":
-            md_path = path
-        if md_path.exists():
-            md_text = md_path.read_text(encoding="utf-8")
-            self.original_md = md_text
-            self.original_html = markdown_to_html(md_text)
-            self.progress_step = 2
-            self.status_message = "已恢复刚上传的文件。点击「翻译」开始翻译。"
-            self._log(f"已恢复：{self.file_name}")
-        else:
-            self.original_md = ""
-            self.original_html = ""
-            self.progress_step = 1
-            self.status_message = "已恢复刚上传的文件。点击「解析」开始解析。"
 
     def _build_engine(self) -> TranslationEngine:
         return build_engine(
@@ -1052,12 +1095,74 @@ def control_bar() -> rx.Component:
 def markdown_preview(content: rx.Var[str], placeholder: str) -> rx.Component:
     return rx.cond(
         content != "",
-        rx.text(
+        rx.markdown(
             content,
-            white_space="pre-wrap",
+            use_gfm=True,
+            use_math=True,
+            use_katex=True,
+            component_map={
+                "p": lambda text: rx.text(
+                    text,
+                    font_size="calc(var(--base-font) * 0.9)",
+                    line_height="1.75",
+                    margin_bottom="0.75rem",
+                    color=UISettingsState.text_color,
+                    overflow_wrap="anywhere",
+                ),
+                "li": lambda text: rx.list.item(
+                    text,
+                    font_size="calc(var(--base-font) * 0.9)",
+                    line_height="1.75",
+                    color=UISettingsState.text_color,
+                    overflow_wrap="anywhere",
+                ),
+                "h1": lambda text: rx.heading(
+                    text,
+                    size="5",
+                    margin="0.8rem 0 0.6rem",
+                    color=UISettingsState.text_color,
+                ),
+                "h2": lambda text: rx.heading(
+                    text,
+                    size="4",
+                    margin="0.8rem 0 0.6rem",
+                    color=UISettingsState.text_color,
+                ),
+                "h3": lambda text: rx.heading(
+                    text,
+                    size="3",
+                    margin="0.7rem 0 0.5rem",
+                    color=UISettingsState.text_color,
+                ),
+                "code": lambda text: rx.code(
+                    text,
+                    white_space="pre-wrap",
+                    overflow_wrap="anywhere",
+                    font_size="calc(var(--base-font) * 0.82)",
+                ),
+            },
+            width="100%",
+            max_width="100%",
+            min_width="0",
             font_size="calc(var(--base-font) * 0.9)",
             line_height="1.75",
             color=UISettingsState.text_color,
+            style={
+                "& img": {
+                    "max_width": "100%",
+                    "height": "auto",
+                    "display": "block",
+                },
+                "& pre": {
+                    "max_width": "100%",
+                    "overflow_x": "auto",
+                },
+                "& table": {
+                    "display": "block",
+                    "max_width": "100%",
+                    "overflow_x": "auto",
+                },
+            },
         ),
         rx.text(
             placeholder,

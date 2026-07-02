@@ -18,6 +18,8 @@ import threading
 import time
 from pathlib import Path
 
+from src.core.markdown_links import normalize_escaped_brackets_in_link_labels
+
 import paths  # noqa: F401 — sets MODEL_CACHE_DIR before marker/surya imports
 
 
@@ -146,8 +148,20 @@ def main():
         gc.collect()
 
         log("Creating converter...")
-        log(f"Marker config: {config}")
-        converter = PdfConverter(artifact_dict=models, config=config)
+        disable_equations = bool(config.pop("_disable_equation_processor", False))
+        processor_list = None
+        if disable_equations:
+            processor_list = [
+                f"{processor.__module__}.{processor.__name__}"
+                for processor in PdfConverter.default_processors
+                if processor.__name__ != "EquationProcessor"
+            ]
+        log(f"Marker config: {config}; disable_equations={disable_equations}")
+        converter = PdfConverter(
+            artifact_dict=models,
+            config=config,
+            processor_list=processor_list,
+        )
         log("Converter ready.")
 
         log(f"Parsing {pdf_path}...")
@@ -245,7 +259,10 @@ def _has_usable_pdf_text_layer(pdf_path: Path) -> bool:
         return False
 
 
-def parse_pdf_to_markdown(pdf_path: str | Path) -> tuple[str, dict]:
+def parse_pdf_to_markdown(
+    pdf_path: str | Path,
+    _disable_equations: bool = False,
+) -> tuple[str, dict]:
     """Convert PDF to Markdown via Marker in an isolated subprocess.
 
     Returns (markdown_text, images_dict).
@@ -255,8 +272,25 @@ def parse_pdf_to_markdown(pdf_path: str | Path) -> tuple[str, dict]:
     log_dir = project_root / "logs"
     log_dir.mkdir(exist_ok=True)
     worker_log_path = log_dir / "marker_worker.log"
+    try:
+        previous_log = worker_log_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        previous_log = ""
+    previous_equation_crash = (
+        str(pdf_path) in previous_log
+        and (
+            (
+                "access violation" in previous_log.lower()
+                and "processors\\equation.py" in previous_log
+            )
+            or "disable_equations=True" in previous_log
+        )
+    )
+    _disable_equations = _disable_equations or previous_equation_crash
     worker_log_path.write_text("", encoding="utf-8")
     marker_config = {"disable_ocr": True} if _has_usable_pdf_text_layer(pdf_path) else {}
+    if _disable_equations:
+        marker_config["_disable_equation_processor"] = True
 
     with tempfile.TemporaryDirectory(prefix="marker_") as tmpdir:
         result_path = Path(tmpdir) / "result.json"
@@ -305,7 +339,11 @@ def parse_pdf_to_markdown(pdf_path: str | Path) -> tuple[str, dict]:
                 try:
                     line = output_queue.get(timeout=1)
                 except queue.Empty:
-                    if proc.poll() is not None and reader_done:
+                    # On Windows, ML libraries spawned inside Marker can leave
+                    # inherited stdout handles open after the main worker exits.
+                    # Waiting for the pipe EOF can then hang forever even
+                    # though the worker wrote result.json successfully.
+                    if proc.poll() is not None:
                         break
                     continue
 
@@ -323,6 +361,24 @@ def parse_pdf_to_markdown(pdf_path: str | Path) -> tuple[str, dict]:
             stderr = stdout
 
             if returncode != 0:
+                native_crash = any(
+                    marker in stderr.lower()
+                    for marker in (
+                        "access violation",
+                        "windows fatal exception",
+                        "segmentation fault",
+                    )
+                ) or returncode in {-1073741819, 3221225477}
+                if (
+                    native_crash
+                    and not _disable_equations
+                    and _has_usable_pdf_text_layer(pdf_path)
+                ):
+                    _force_free_memory()
+                    return parse_pdf_to_markdown(
+                        pdf_path,
+                        _disable_equations=True,
+                    )
                 # Detect OOM
                 if "MemoryError" in stderr or "allocate" in stderr or "out of memory" in stderr.lower():
                     raise MemoryError(
@@ -339,7 +395,7 @@ def parse_pdf_to_markdown(pdf_path: str | Path) -> tuple[str, dict]:
             with open(result_path, "r", encoding="utf-8") as f:
                 result = json.load(f)
 
-            md_text = result["markdown"]
+            md_text = normalize_escaped_brackets_in_link_labels(result["markdown"])
             img_dir = result.get("img_dir", "")
             images = {}
             for name in result.get("images", []):
@@ -361,7 +417,10 @@ def unload_marker_models() -> None:
 def save_markdown(md_text: str, pdf_path: str | Path, images: dict | None = None) -> Path:
     """Save Markdown and images next to the original PDF. Returns the .md path."""
     md_path = Path(pdf_path).with_suffix(".md")
-    md_path.write_text(md_text, encoding="utf-8")
+    md_path.write_text(
+        normalize_escaped_brackets_in_link_labels(md_text),
+        encoding="utf-8",
+    )
     if images:
         for name, img_data in images.items():
             img_path = md_path.parent / name

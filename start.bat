@@ -7,6 +7,14 @@ if not exist ".venv\Scripts\reflex.exe" (
     pause
     exit /b 1
 )
+
+rem Reuse the running app instead of starting another frontend/backend pair.
+powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 http://localhost:3000/translate; if ($r.StatusCode -eq 200 -and $r.Content -match '__reactRouterContext') { exit 0 } } catch {}; exit 1" >nul 2>&1
+if not errorlevel 1 (
+    start http://localhost:3000/translate
+    exit /b 0
+)
+
 if exist "scripts\patch_vite_watch.py" (
     ".venv\Scripts\python.exe" "scripts\patch_vite_watch.py"
 )

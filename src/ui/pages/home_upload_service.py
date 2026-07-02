@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+import hashlib
 import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,8 +34,28 @@ class SavedUpload:
 
 def short_stem(filename: str, max_len: int = 20) -> str:
     """Truncate filename stem for user-facing generated filenames."""
-    stem = Path(filename).stem
-    return stem[:max_len] if len(stem) > max_len else stem
+    stem = Path(filename).stem.strip()
+    # Windows silently normalizes trailing spaces/dots in directory names.
+    # Strip them before constructing paths so mkdir() and write_bytes() refer
+    # to the same directory.
+    shortened = stem[:max_len].rstrip(" .")
+    return shortened or "document"
+
+
+def unique_upload_stem(filename: str, data: bytes, max_prefix_len: int = 64) -> str:
+    """Return a readable, collision-resistant folder name for persisted uploads.
+
+    Translation caches are keyed by folder name. A plain truncated title can
+    collide for papers with the same leading words, so include a short content
+    digest while keeping the title readable in the filesystem.
+    """
+    raw_stem = Path(filename).stem.strip()
+    prefix = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", raw_stem)
+    prefix = re.sub(r"\s+", " ", prefix).strip(" .")
+    if len(prefix) > max_prefix_len:
+        prefix = prefix[:max_prefix_len].rstrip(" .")
+    digest = hashlib.sha1(data).hexdigest()[:10]
+    return f"{prefix or 'document'}-{digest}"
 
 
 def file_info(data: bytes, filename: str) -> str:
@@ -102,7 +124,7 @@ async def save_upload(upload: Any) -> SavedUpload:
 
 async def save_translation_upload(upload: Any) -> SavedUpload:
     """Save a full-paper translation upload in the translation workspace."""
-    return await _save_upload_to(upload, TRANSLATE_UPLOAD_DIR)
+    return await _save_upload_to(upload, TRANSLATE_UPLOAD_DIR, unique_folder=True)
 
 
 async def save_chat_upload(upload: Any) -> SavedUpload:
@@ -110,14 +132,14 @@ async def save_chat_upload(upload: Any) -> SavedUpload:
     return await _save_upload_to(upload, CHAT_UPLOAD_DIR)
 
 
-async def _save_upload_to(upload: Any, root: Path) -> SavedUpload:
+async def _save_upload_to(upload: Any, root: Path, *, unique_folder: bool = False) -> SavedUpload:
     safe_name = Path(upload.filename).name
     suffix = Path(safe_name).suffix.lower()
-    stem = short_stem(safe_name)
+    data = await upload.read()
+    stem = unique_upload_stem(safe_name, data) if unique_folder else short_stem(safe_name)
     folder = root / stem
     folder.mkdir(parents=True, exist_ok=True)
     destination = folder / safe_name
-    data = await upload.read()
     destination.write_bytes(data)
 
     return SavedUpload(

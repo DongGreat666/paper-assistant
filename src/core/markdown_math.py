@@ -4,7 +4,11 @@ import re
 
 
 _CODE_SPAN_PATTERN = re.compile(r"(```[\s\S]*?```|`[^`\n]*`)")
-_DISPLAY_MATH_PATTERN = re.compile(r"\\\[\s*([\s\S]*?)\s*\\\]")
+# Marker escapes the square brackets around linked citations as ``[\[...\]]``.
+# The opening ``\[`` in that sequence is Markdown punctuation, not a TeX math
+# delimiter.  Requiring it not to be immediately preceded by ``[`` keeps those
+# citations intact while still accepting normal LaTeX ``\[...\]`` blocks.
+_DISPLAY_MATH_PATTERN = re.compile(r"(?<!\[)\\\[\s*([\s\S]*?)\s*\\\]")
 _INLINE_MATH_PATTERN = re.compile(r"\\\((.+?)\\\)")
 
 

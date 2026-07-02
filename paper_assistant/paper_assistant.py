@@ -11,6 +11,7 @@ from src.ui.pages.library import LibraryState
 from src.ui.pages.library_ui import library_page
 from src.ui.pages.settings import settings_page
 from src.ui.pages.translate import TranslateState, translate_page
+from src.ui.pages.home_upload_service import TRANSLATE_UPLOAD_DIR
 
 # --- PDF file serving ---
 UPLOAD_DIR = get_config().papers_dir.resolve()
@@ -59,6 +60,23 @@ async def pdf_highlights(request: Request):
     )
 
 
+async def serve_translation_asset(request: Request):
+    """Serve generated translation images without exposing arbitrary files."""
+    relative_path = request.path_params["path"]
+    root = TRANSLATE_UPLOAD_DIR.resolve()
+    full_path = (root / relative_path).resolve()
+    if not full_path.is_relative_to(root):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    if full_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    if not full_path.exists() or not full_path.is_file():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return FileResponse(
+        str(full_path),
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 # --- Pages ---
 def index() -> rx.Component:
     return home_page()
@@ -69,13 +87,14 @@ app = rx.App()
 # Register custom API routes
 app._api.add_route("/api/pdf/{path:path}", serve_pdf)
 app._api.add_route("/api/pdf-highlights", pdf_highlights)
+app._api.add_route("/api/translation-asset/{path:path}", serve_translation_asset)
 
 app.add_page(index, route="/", title="Paper Assistant")
 app.add_page(
     translate_page,
     route="/translate",
     title="论文翻译",
-    on_load=TranslateState.restore_recent_upload,
+    on_load=TranslateState.reset_flow,
 )
 app.add_page(library_page, route="/library", title="我的论文", on_load=LibraryState.load_papers)
 app.add_page(settings_page, route="/settings", title="设置与用户")

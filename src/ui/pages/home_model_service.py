@@ -2,6 +2,8 @@
 
 from typing import Any
 
+import httpx
+
 from config import get_config, read_settings, write_settings
 from src.core.engine import (
     TranslationEngine,
@@ -221,7 +223,22 @@ async def chat_completion(
 
 async def test_profile(profile: dict) -> None:
     engine = build_engine_from_profile(profile, default_profile="qa")
-    await chat_completion([{"role": "user", "content": "Reply briefly: OK"}], engine, max_tokens=200)
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10, read=45, write=10, pool=5),
+        limits=httpx.Limits(max_connections=2, max_keepalive_connections=0),
+    ) as client:
+        response = await client.post(
+            chat_completions_url(engine.base_url),
+            headers={"Authorization": f"Bearer {engine.api_key.strip()}"},
+            json={
+                "model": engine.model,
+                "messages": [{"role": "user", "content": "Reply briefly: OK"}],
+                "temperature": engine.temperature,
+                "max_tokens": 200,
+            },
+        )
+        response.raise_for_status()
+        chat_message_content(response.json())
 
 
 def select_engine_action(profiles: list[dict], profile_id: str) -> dict | None:

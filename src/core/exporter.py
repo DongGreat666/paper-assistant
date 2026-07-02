@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 import re
 from html import escape
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import markdown
 
@@ -57,6 +60,11 @@ _CODE_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=")
 _CODE_SHAPE_DECL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\[[^\]]+\]\s*[-=]")
 _CODE_NAME_DECL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*-\s+")
 _FENCED_CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)\n```", re.DOTALL)
+_DISPLAY_MATH = re.compile(r"(?<!\\)\$\$(.+?)(?<!\\)\$\$", re.DOTALL)
+_INLINE_MATH = re.compile(r"(?<!\\)\$(?!\$)([^\n$]+?)(?<!\\)\$(?!\$)")
+_DISPLAY_MATH_BRACKETS = re.compile(r"\\\[(.+?)\\\]", re.DOTALL)
+_INLINE_MATH_PARENTHESES = re.compile(r"\\\(([^\n]+?)\\\)")
+_HTML_IMAGE_SRC = re.compile(r"(<img\b[^>]*\bsrc=[\"'])([^\"']+)([\"'])", re.IGNORECASE)
 
 
 def _looks_like_orphan_code_line(line: str) -> bool:
@@ -219,14 +227,82 @@ def make_reading_markdown(md_text: str) -> str:
     return make_compact_markdown(md_text)
 
 
+def _protect_math_for_markdown(md_text: str) -> tuple[str, dict[str, tuple[str, bool]]]:
+    """Replace TeX delimiters with Markdown-safe tokens before HTML conversion."""
+    formulas: dict[str, tuple[str, bool]] = {}
+
+    def stash(match: re.Match[str], display: bool) -> str:
+        token = f"PAKATEX{len(formulas)}TOKEN"
+        formulas[token] = (match.group(1).strip(), display)
+        return token
+
+    protected = _DISPLAY_MATH_BRACKETS.sub(lambda match: stash(match, True), md_text)
+    protected = _DISPLAY_MATH.sub(lambda match: stash(match, True), protected)
+    protected = _INLINE_MATH_PARENTHESES.sub(lambda match: stash(match, False), protected)
+    protected = _INLINE_MATH.sub(lambda match: stash(match, False), protected)
+    return protected, formulas
+
+
+def _restore_math_nodes(html_text: str, formulas: dict[str, tuple[str, bool]]) -> str:
+    """Turn protected TeX tokens into nodes rendered by KaTeX before printing."""
+    for token, (tex, display) in formulas.items():
+        kind = "block" if display else "inline"
+        node = (
+            f'<span class="paper-math paper-math-{kind}" '
+            f'data-tex="{escape(tex, quote=True)}" '
+            f'data-display="{str(display).lower()}"></span>'
+        )
+        html_text = html_text.replace(token, node)
+    return html_text
+
+
+def _katex_dist_dir() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / ".web" / "node_modules" / "katex" / "dist"
+
+
+def _katex_css() -> str:
+    """Load local KaTeX CSS and make font URLs absolute for set_content pages."""
+    dist_dir = _katex_dist_dir()
+    css = (dist_dir / "katex.min.css").read_text(encoding="utf-8")
+    font_base = (dist_dir / "fonts").resolve().as_uri().rstrip("/") + "/"
+    return css.replace("url(fonts/", f"url({font_base}")
+
+
+def _embed_local_images(html_text: str, base_dir: str | Path | None) -> str:
+    """Embed local Markdown images so Chromium can print them from set_content."""
+    if not base_dir:
+        return html_text
+    root = Path(base_dir).resolve()
+
+    def replace_image(match: re.Match[str]) -> str:
+        source = match.group(2).strip()
+        parsed = urlparse(source)
+        if parsed.scheme or source.startswith(("/", "#", "data:")):
+            return match.group(0)
+        image_path = (root / unquote(parsed.path)).resolve()
+        if not image_path.is_relative_to(root) or not image_path.is_file():
+            return match.group(0)
+        mime_type, _ = mimetypes.guess_type(image_path.name)
+        if not mime_type or not mime_type.startswith("image/"):
+            return match.group(0)
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        data_url = f"data:{mime_type};base64,{encoded}"
+        return f"{match.group(1)}{data_url}{match.group(3)}"
+
+    return _HTML_IMAGE_SRC.sub(replace_image, html_text)
+
+
 def markdown_to_html_document(md_text: str, title: str = "", base_dir: str | Path | None = None) -> str:
     """Render Markdown into a printable HTML document."""
     md_text = format_markdown_for_display(md_text)
+    md_text, formulas = _protect_math_for_markdown(md_text)
     body = markdown.markdown(
         md_text,
         extensions=["extra", "sane_lists", "toc"],
         output_format="html5",
     )
+    body = _restore_math_nodes(body, formulas)
+    body = _embed_local_images(body, base_dir)
     base_tag = ""
     if base_dir:
         base_href = Path(base_dir).resolve().as_uri().rstrip("/") + "/"
@@ -319,6 +395,22 @@ hr {{
   list-style: none;
   padding-left: 1em;
 }}
+.paper-math-inline {{
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: middle;
+}}
+.paper-math-block {{
+  display: block;
+  margin: 1em 0;
+  max-width: 100%;
+  overflow-x: auto;
+  text-align: center;
+}}
+.katex-display {{
+  margin: 0.9em 0;
+  overflow: hidden;
+}}
 </style>
 </head>
 <body>
@@ -336,10 +428,32 @@ async def markdown_to_pdf(md_text: str, output_path: str | Path, title: str = ""
     from playwright.async_api import async_playwright
 
     html = markdown_to_html_document(md_text, title=title, base_dir=output.parent)
+    katex_dist = _katex_dist_dir()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         await page.set_content(html, wait_until="networkidle")
+        await page.add_style_tag(content=_katex_css())
+        await page.add_script_tag(path=str(katex_dist / "katex.min.js"))
+        await page.evaluate(
+            """
+            () => {
+              const nodes = Array.from(document.querySelectorAll('.paper-math[data-tex]'));
+              for (const node of nodes) {
+                window.katex.render(node.dataset.tex || '', node, {
+                  displayMode: node.dataset.display === 'true',
+                  throwOnError: false,
+                  strict: false,
+                  trust: false,
+                  output: 'htmlAndMathml',
+                });
+              }
+              window.__paperAssistantKatexRendered = true;
+            }
+            """
+        )
+        await page.wait_for_function("window.__paperAssistantKatexRendered === true")
+        await page.evaluate("document.fonts.ready")
         await page.pdf(
             path=str(output),
             format="A4",
