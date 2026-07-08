@@ -259,6 +259,32 @@ def _has_usable_pdf_text_layer(pdf_path: Path) -> bool:
         return False
 
 
+def _marker_config_for_pdf(pdf_path: Path, disable_equations: bool = False) -> dict:
+    """Build Marker config while keeping table OCR fallback available.
+
+    For selectable-text PDFs we disable full-page OCR to keep parsing fast and
+    avoid duplicated body text.  Marker's TableProcessor can still need OCR for
+    individual table cells when pdftext cannot map text into the detected table
+    grid, so explicitly re-enable OCR for that processor.
+    """
+    config = {}
+    if _has_usable_pdf_text_layer(pdf_path):
+        config.update(
+            {
+                "disable_ocr": True,
+                "TableProcessor_disable_ocr": False,
+                # Large tables are less likely to exhaust memory or interleave
+                # progress workers when processed in smaller batches.
+                "TableProcessor_table_rec_batch_size": 2,
+                "TableProcessor_detection_batch_size": 2,
+                "TableProcessor_recognition_batch_size": 16,
+            }
+        )
+    if disable_equations:
+        config["_disable_equation_processor"] = True
+    return config
+
+
 def parse_pdf_to_markdown(
     pdf_path: str | Path,
     _disable_equations: bool = False,
@@ -288,9 +314,7 @@ def parse_pdf_to_markdown(
     )
     _disable_equations = _disable_equations or previous_equation_crash
     worker_log_path.write_text("", encoding="utf-8")
-    marker_config = {"disable_ocr": True} if _has_usable_pdf_text_layer(pdf_path) else {}
-    if _disable_equations:
-        marker_config["_disable_equation_processor"] = True
+    marker_config = _marker_config_for_pdf(pdf_path, _disable_equations)
 
     with tempfile.TemporaryDirectory(prefix="marker_") as tmpdir:
         result_path = Path(tmpdir) / "result.json"
