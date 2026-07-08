@@ -13,9 +13,15 @@ from src.core.engine import (
 )
 from src.core import chat_history
 from src.core.markdown_math import normalize_math_delimiters, normalize_message_math
+from src.core.web_search import (
+    format_search_context,
+    plan_web_search,
+    web_search_many,
+)
 from src.ui.pages.home_chat_service import stream_chat_completion, trim_context
 from src.ui.pages.home_model_service import (
     build_home_engine,
+    chat_completion,
     current_engine_label,
     delete_engine_action,
     find_profile,
@@ -71,6 +77,7 @@ class HomeState(rx.State):
     messages: list[dict] = []
     pending_image_data_url: str = ""
     pending_image_name: str = ""
+    web_search_enabled: bool = False
 
     # Conversation persistence
     conversation_id: str = ""
@@ -192,6 +199,14 @@ class HomeState(rx.State):
         self.pending_image_data_url = ""
         self.pending_image_name = ""
 
+    def toggle_web_search(self):
+        self.web_search_enabled = not self.web_search_enabled
+        self.status_message = (
+            "联网搜索已开启：后续问题会先搜索网页。"
+            if self.web_search_enabled
+            else "联网搜索已关闭：默认只基于本地论文和聊天上下文。"
+        )
+
     async def _send_current_message(self):
         question = self.input_text.strip()
         image_data_url = self.pending_image_data_url
@@ -229,7 +244,41 @@ class HomeState(rx.State):
             # Append empty assistant message, then stream into it
             self.messages = self.messages + [{"role": "assistant", "content": ""}]
             yield
-            async for chunk in stream_chat_completion(self._build_messages(question, image_data_url), engine):
+
+            search_context = ""
+            if not image_data_url:
+                self.status_message = "正在判断是否需要联网搜索..."
+                yield
+                try:
+                    plan = await plan_web_search(
+                        question,
+                        engine,
+                        paper_context=trim_context(self.paper_md) if self.paper_ready else "",
+                        chat_history=self.messages[-8:],
+                        force_search=self.web_search_enabled,
+                    )
+                    if plan.should_search:
+                        self.status_message = "正在联网搜索..."
+                        yield
+                        results = await web_search_many(plan.queries)
+                        search_context = format_search_context(results)
+                        if search_context:
+                            self.status_message = f"已找到 {len(results)} 条网页结果，正在生成回答..."
+                        else:
+                            self.status_message = "未找到可用网页结果，继续基于本地上下文回答..."
+                        yield
+                    else:
+                        self.status_message = "无需联网，正在基于本地上下文生成回答..."
+                        yield
+                except Exception as exc:
+                    search_context = ""
+                    self.status_message = f"联网搜索失败，继续基于本地上下文回答：{exc}"
+                    yield
+
+            async for chunk in stream_chat_completion(
+                self._build_messages(question, image_data_url, search_context),
+                engine,
+            ):
                 accumulated += chunk
                 self.messages = self.messages[:-1] + [
                     {"role": "assistant", "content": normalize_math_delimiters(accumulated)}
@@ -247,6 +296,70 @@ class HomeState(rx.State):
             self._delete_pending_image_source()
             self.is_chatting = False
             self._save_chat()
+            await self._maybe_generate_chat_title(engine)
+            yield
+
+    async def _maybe_generate_chat_title(self, engine):
+        """Generate a ChatGPT-style short title after the first real exchange."""
+        if not self.conversation_id or not has_usable_api_key(engine.api_key):
+            return
+
+        conv = chat_history.load(self.conversation_id)
+        if conv is None:
+            return
+
+        messages = conv.get("messages", [])
+        user_messages = [
+            str(item.get("content", "")).strip()
+            for item in messages
+            if item.get("role") == "user" and str(item.get("content", "")).strip()
+        ]
+        assistant_messages = [
+            str(item.get("content", "")).strip()
+            for item in messages
+            if item.get("role") == "assistant" and str(item.get("content", "")).strip()
+        ]
+        if not user_messages or not assistant_messages:
+            return
+
+        fallback_title = chat_history.conversation_title(messages, conv.get("paper", ""))
+        current_title = str(conv.get("title", "") or "")
+        if current_title and current_title != fallback_title and not current_title.startswith("已上传 "):
+            return
+
+        title_prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "你是聊天标题生成器。请根据对话内容生成一个简短中文标题。"
+                    "要求：6到14个汉字为佳；不要引号；不要句号；不要解释；"
+                    "不要使用“你好”“已上传”这类无意义开头。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "论文名："
+                    f"{conv.get('paper', '') or '无'}\n\n"
+                    "用户问题："
+                    f"{user_messages[0][:500]}\n\n"
+                    "助手回答摘要："
+                    f"{assistant_messages[-1][:700]}"
+                ),
+            },
+        ]
+        try:
+            generated = await chat_completion(title_prompt, engine, max_tokens=40)
+            title = chat_history.clean_generated_title(generated)
+        except Exception as exc:
+            logger.warning(f"Failed to generate chat title: {exc}")
+            return
+
+        if not title:
+            return
+        conv["title"] = title
+        chat_history.save(conv)
+        self.conversations = chat_history.list_conversations()
 
     def _delete_pending_image_source(self):
         if not self.saved_path:
@@ -261,8 +374,24 @@ class HomeState(rx.State):
             pass
         self.saved_path = ""
 
-    def _build_messages(self, question: str, image_data_url: str = "") -> list[dict]:
+    def _build_messages(
+        self,
+        question: str,
+        image_data_url: str = "",
+        search_context: str = "",
+    ) -> list[dict]:
         messages: list[dict] = []
+        if search_context:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "下面是联网搜索结果。回答时请优先结合用户上传论文内容；"
+                    "如果使用了网页信息，请在回答中给出对应 URL。"
+                    "如果搜索结果和论文内容冲突，请明确说明。\n\n"
+                    f"{search_context}"
+                ),
+            })
+
         if self.paper_ready:
             context = trim_context(self.paper_md)
             messages.append({
@@ -411,7 +540,7 @@ class HomeState(rx.State):
                 conv["messages"] = self.messages
                 conv["paper"] = self.file_name
                 conv["engine"] = engine_label
-                chat_history.update_title(conv, self.messages[0].get("content", ""))
+                chat_history.update_title(conv, self.messages, self.file_name)
         chat_history.save(conv)
         self.conversations = chat_history.list_conversations()
 

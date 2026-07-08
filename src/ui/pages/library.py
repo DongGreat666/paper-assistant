@@ -180,6 +180,7 @@ class LibraryState(rx.State):
     folders: list[dict] = []
     folder_tree: list[FolderItem] = []
     expanded_folder: str = ""  # currently expanded folder name (only one at a time)
+    upload_target_folder: str = ""
     new_folder_name: str = ""
     creating_folder: bool = False
     file_status: str = ""
@@ -407,6 +408,7 @@ class LibraryState(rx.State):
 
     def toggle_folder(self, name: str):
         """Toggle expand/collapse of a folder."""
+        self.upload_target_folder = name
         if self.expanded_folder == name:
             self.expanded_folder = ""
         else:
@@ -445,6 +447,7 @@ class LibraryState(rx.State):
         try:
             target.mkdir(parents=True, exist_ok=True)
             self.expanded_folder = name
+            self.upload_target_folder = name
             self.file_status = f"已新建文件夹：{name}"
         except Exception:
             self.file_status = "新建文件夹失败。"
@@ -453,11 +456,12 @@ class LibraryState(rx.State):
         self.load_papers()
 
     async def upload_papers(self, files: list[rx.UploadFile]):
-        folder = self.expanded_folder or self.selected_folder or "未分类"
+        folder = self.upload_target_folder or self.expanded_folder or self.selected_folder or "未分类"
         return await self.upload_papers_to_folder(folder, files)
 
     async def upload_papers_to_folder(self, folder: str, files: list[rx.UploadFile]):
         if not files:
+            self.file_status = "未选择文件。"
             return
         folder = self._safe_name(folder)
         target_folder = self._safe_folder_path(folder)
@@ -481,6 +485,7 @@ class LibraryState(rx.State):
             last_saved = dest
 
         self.expanded_folder = folder
+        self.upload_target_folder = folder
         self.file_status = f"已上传到：{folder}"
         self.load_papers()
         if last_saved:
@@ -521,6 +526,8 @@ class LibraryState(rx.State):
                 self.annotations = []
             shutil.move(str(old_path), str(new_path))
             self.expanded_folder = new_name
+            if self.upload_target_folder == old_name:
+                self.upload_target_folder = new_name
             self.cancel_rename_folder()
             self.load_papers()
             self.file_status = f"已重命名文件夹：{new_name}"
@@ -542,6 +549,8 @@ class LibraryState(rx.State):
                 self.pdf_reader_url = ""
             if self.expanded_folder == name:
                 self.expanded_folder = ""
+            if self.upload_target_folder == name:
+                self.upload_target_folder = ""
             self.file_status = f"已移到回收站：{name}"
             self.load_papers()
         else:
@@ -605,6 +614,7 @@ class LibraryState(rx.State):
     def select_paper(self, title: str, folder: str, path: str):
         self.selected_paper = title
         self.selected_folder = folder
+        self.upload_target_folder = folder
         safe_folder = quote(folder)
         safe_file = quote(path.split("/", 1)[1] if "/" in path else path)
         self.pdf_reader_url = f"/pdf-reader/index.html?file=/api/pdf/{safe_folder}/{safe_file}"

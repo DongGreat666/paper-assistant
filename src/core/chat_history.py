@@ -42,22 +42,70 @@ def _make_title(first_user_msg: str) -> str:
     return text[:40] + ("..." if len(text) > 40 else "")
 
 
+def clean_generated_title(title: str) -> str:
+    """Clean an LLM-generated chat title for sidebar display."""
+    text = str(title or "").strip()
+    text = re.sub(r"^(标题|对话标题|聊天标题)\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip(" \t\r\n\"'“”‘’`#*-：:。.!！?？")
+    text = re.sub(r"\s+", " ", text)
+    if not text:
+        return ""
+    text = text[:24] + ("..." if len(text) > 24 else "")
+    return text.strip(" \t\r\n\"'“”‘’`#*-：:。.!！?？")
+
+
+def _paper_title(paper: str) -> str:
+    """Return a readable title from an attached paper filename."""
+    if not paper:
+        return ""
+    text = Path(paper).stem.strip() or paper.strip()
+    return _make_title(text)
+
+
+def _is_upload_status_message(message: dict) -> bool:
+    """Return whether a message is an internal upload/progress notice."""
+    content = str(message.get("content", "")).strip()
+    return (
+        message.get("role") == "assistant"
+        and content.startswith("已上传 ")
+        and "正在准备问答上下文" in content
+    )
+
+
+def conversation_title(messages: list[dict] | None = None, paper: str = "") -> str:
+    """Derive a stable sidebar title.
+
+    Prefer the first real user question.  Upload-only chats fall back to the
+    paper name instead of the internal "已上传 xxx" progress message.
+    """
+    for message in messages or []:
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content", "")).strip()
+        if content:
+            return _make_title(content)
+    if any(_is_upload_status_message(message) for message in messages or []):
+        return _paper_title(paper)
+    return _paper_title(paper)
+
+
+def _is_bad_auto_title(title: str) -> bool:
+    """Return whether an old title was generated from an upload notice."""
+    return title.strip().startswith("已上传 ")
+
+
 def new_conversation(paper: str = "", messages: list[dict] | None = None, engine: str = "") -> dict:
     """Create a conversation dict (not yet saved)."""
+    initial_messages = messages or []
     conv = {
         "id": uuid.uuid4().hex[:12],
-        "title": "",
+        "title": conversation_title(initial_messages, paper),
         "paper": paper,
         "engine": engine,
-        "messages": messages or [],
+        "messages": initial_messages,
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
     }
-    # Auto-title from first user message
-    for m in conv["messages"]:
-        if m.get("role") == "user" and m.get("content", "").strip():
-            conv["title"] = _make_title(m["content"])
-            break
     return conv
 
 
@@ -128,10 +176,23 @@ def list_conversations() -> list[dict]:
         except (ValueError, TypeError):
             time_label = ""
 
+        stored_title = str(data.get("title", "") or "")
+        title = stored_title
+        if not title or _is_bad_auto_title(title):
+            title = conversation_title(data.get("messages", []), data.get("paper", ""))
+        if not title:
+            title = "未命名对话"
+
+        paper = data.get("paper", "")
+        paper_label = paper
+        if paper and (title == paper or title == _paper_title(paper) or stored_title == _paper_title(paper)):
+            paper_label = ""
+
         summaries.append({
             "id": path.stem,
-            "title": data.get("title", "未命名对话"),
-            "paper": data.get("paper", ""),
+            "title": title,
+            "paper": paper,
+            "paper_label": paper_label,
             "engine": data.get("engine", ""),
             "time_label": time_label,
             "updated_at": updated,
@@ -142,7 +203,8 @@ def list_conversations() -> list[dict]:
     return summaries
 
 
-def update_title(conv: dict, first_user_msg: str) -> None:
-    """Set title from first user message if not already set."""
-    if not conv.get("title") and first_user_msg.strip():
-        conv["title"] = _make_title(first_user_msg)
+def update_title(conv: dict, messages: list[dict] | None = None, paper: str = "") -> None:
+    """Set or repair auto-generated titles."""
+    current = str(conv.get("title", "") or "")
+    if not current or _is_bad_auto_title(current):
+        conv["title"] = conversation_title(messages or conv.get("messages", []), paper or conv.get("paper", ""))

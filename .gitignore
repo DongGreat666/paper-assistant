@@ -36,6 +36,7 @@ env/
 data/vector_db/
 data/chat_history/
 data/chat_uploads/
+data/reflex_uploads/
 data/cache/
 data/settings.json
 data/translation_engines.json

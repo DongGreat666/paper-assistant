@@ -240,12 +240,12 @@ def chat_entry(chat, on_click, on_delete, active_id) -> rx.Component:
                 font_size="calc(var(--base-font) * 0.82)",
                 color=rx.cond(is_active, UISettingsState.text_color, UISettingsState.muted_text_color),
                 font_weight=rx.cond(is_active, "650", "400"),
-                no_of_lines=1,
+                no_of_lines=2,
             ),
             rx.hstack(
                 rx.cond(
-                    chat["paper"] != "",
-                    rx.text(chat["paper"], font_size="calc(var(--base-font) * 0.67)", color="#8a94a6", no_of_lines=1),
+                    chat["paper_label"] != "",
+                    rx.text(chat["paper_label"], font_size="calc(var(--base-font) * 0.67)", color="#8a94a6", no_of_lines=1),
                     rx.box(),
                 ),
                 rx.cond(

@@ -99,6 +99,11 @@ class Config:
         self.summary_model: str = os.getenv("SUMMARY_MODEL", "")
         self.summary_temperature: float = _safe_float(os.getenv("SUMMARY_TEMPERATURE"), 0.3)
 
+        # --- Web search (optional) ---
+        self.web_search_provider: str = os.getenv("WEB_SEARCH_PROVIDER", "duckduckgo")
+        self.web_search_api_key: str = os.getenv("WEB_SEARCH_API_KEY", "")
+        self.web_search_max_results: int = _safe_int(os.getenv("WEB_SEARCH_MAX_RESULTS"), 5)
+
         # --- RAG ---
         self.embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
         self.chunk_size: int = _safe_int(os.getenv("CHUNK_SIZE"), 500)

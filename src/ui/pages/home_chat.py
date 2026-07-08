@@ -305,6 +305,32 @@ if (!window.__paperAssistantPasteInstalled) {
                 rx.text("自动模型", font_size="calc(var(--base-font) * 0.74)", color=UISettingsState.muted_text_color),
                 rx.text("自定义", font_size="calc(var(--base-font) * 0.74)", color=UISettingsState.muted_text_color),
             ),
+            rx.cond(
+                HomeState.web_search_enabled,
+                rx.button(
+                    rx.icon(tag="globe", size=15),
+                    "联网开",
+                    size="2",
+                    variant="solid",
+                    color_scheme="blue",
+                    type="button",
+                    on_click=HomeState.toggle_web_search,
+                ),
+                rx.button(
+                    rx.icon(tag="globe", size=15),
+                    "联网关",
+                    size="2",
+                    variant="soft",
+                    color_scheme="gray",
+                    type="button",
+                    on_click=HomeState.toggle_web_search,
+                ),
+            ),
+            rx.text(
+                "含“最新/联网/查一下”会自动搜",
+                font_size="calc(var(--base-font) * 0.72)",
+                color=UISettingsState.muted_text_color,
+            ),
             rx.spacer(),
             rx.button(
                 rx.icon(tag=rx.cond(HomeState.is_chatting, "loader_circle", "send"), size=17),

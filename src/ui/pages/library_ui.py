@@ -305,13 +305,6 @@ def left_panel() -> rx.Component:
             rx.hstack(
                 rx.text("论文库", font_size="calc(var(--base-font) * 0.9)", font_weight="700"),
                 rx.spacer(),
-                rx.upload(
-                    rx.button(rx.icon(tag="upload", size=14), variant="ghost", size="1", title="导入论文"),
-                    accept={"application/pdf": [".pdf"]},
-                    max_files=10,
-                    border="0",
-                    padding="0",
-                ),
                 width="100%",
                 padding="12px 12px 8px 12px",
             ),
@@ -458,7 +451,7 @@ def empty_state() -> rx.Component:
         rx.icon(tag="book_open", size=52, color="#c1c7d0"),
         rx.text("从左侧选择一篇论文", font_size="calc(var(--base-font) * 0.95)", color=UISettingsState.muted_text_color, font_weight="500"),
         rx.text(
-            "也可以在左侧论文库导入新的 PDF",
+            "先新建或展开文件夹，再在文件夹下导入 PDF",
             font_size="calc(var(--base-font) * 0.78)", color="#b0b8c4",
         ),
         spacing="3",
@@ -849,6 +842,38 @@ def _model_tab() -> rx.Component:
     )
 
 
+def _folder_upload_row(folder: FolderItem) -> rx.Component:
+    """A stable per-folder upload entry shown inside the expanded folder."""
+    return rx.upload(
+        rx.button(
+            rx.icon(tag="upload", size=13),
+            "导入 PDF 到此文件夹",
+            variant="ghost",
+            color_scheme="gray",
+            size="1",
+            width="100%",
+            justify_content="flex-start",
+            font_size="calc(var(--base-font) * 0.68)",
+            font_weight="400",
+            color=UISettingsState.muted_text_color,
+            padding="5px 7px",
+            border_radius="6px",
+            _hover={"bg": UISettingsState.muted_bg, "color": UISettingsState.text_color},
+        ),
+        id="library-folder-upload",
+        accept={"application/pdf": [".pdf"]},
+        max_files=10,
+        on_drop=[
+            LibraryState.upload_papers,
+            rx.clear_selected_files("library-folder-upload"),
+        ],
+        border="none",
+        background="transparent",
+        padding="0",
+        width="100%",
+    )
+
+
 def _folder_tree_item(folder: FolderItem) -> rx.Component:
     """A folder in the tree view with expandable papers."""
     is_expanded = LibraryState.expanded_folder == folder.name
@@ -892,15 +917,30 @@ def _folder_tree_item(folder: FolderItem) -> rx.Component:
                     align="center",
                     cursor="pointer",
                 ),
-                rx.menu.root(
-                    rx.menu.trigger(
-                        rx.button(rx.icon(tag="ellipsis", size=15), size="1", variant="ghost", color_scheme="gray", title="更多操作"),
-                    ),
-                    rx.menu.content(
-                        rx.menu.item(rx.icon(tag="pencil", size=14), "重命名", on_click=LibraryState.start_rename_folder(folder.name)),
-                        rx.menu.item(rx.icon(tag="trash_2", size=14), "移到回收站", color="red", on_click=LibraryState.delete_folder(folder.name)),
+                rx.hstack(
+                    rx.menu.root(
+                        rx.menu.trigger(
+                            rx.button(
+                                rx.icon(tag="ellipsis", size=15),
+                                size="1",
+                                variant="ghost",
+                                color_scheme="gray",
+                                title="更多操作",
+                                width="24px",
+                                height="24px",
+                                min_width="24px",
+                                padding="0",
+                                border_radius="6px",
+                            ),
+                        ),
+                        rx.menu.content(
+                            rx.menu.item(rx.icon(tag="pencil", size=14), "重命名", on_click=LibraryState.start_rename_folder(folder.name)),
+                            rx.menu.item(rx.icon(tag="trash_2", size=14), "移到回收站", color="red", on_click=LibraryState.delete_folder(folder.name)),
+                        ),
                     ),
                     class_name="folder-actions",
+                    spacing="0",
+                    align="center",
                 ),
                 class_name="folder-row",
                 width="100%",
@@ -915,8 +955,10 @@ def _folder_tree_item(folder: FolderItem) -> rx.Component:
         rx.cond(
             is_expanded,
             rx.box(
+                _folder_upload_row(folder),
                 rx.foreach(folder.papers, paper_item),
                 padding_left="14px",
+                padding_top="2px",
                 width="100%",
                 overflow_x="hidden",
             ),
@@ -934,13 +976,21 @@ def _library_tab() -> rx.Component:
             <style>
               .folder-actions, .paper-actions {
                 opacity: 0;
-                width: 0;
+                width: 24px;
                 overflow: hidden;
                 transition: opacity .12s ease, width .12s ease;
               }
               .folder-row:hover .folder-actions, .paper-row:hover .paper-actions {
                 opacity: 1;
-                width: 28px;
+                width: 24px;
+              }
+              .folder-actions button {
+                background: transparent !important;
+                box-shadow: none !important;
+              }
+              .folder-actions button:hover,
+              .folder-actions button[data-state="open"] {
+                background: rgba(15, 23, 42, 0.06) !important;
               }
             </style>
             """
@@ -948,25 +998,15 @@ def _library_tab() -> rx.Component:
         rx.hstack(
             rx.text("我的论文", font_size="calc(var(--base-font) * 0.82)", font_weight="700", color=UISettingsState.text_color),
             rx.spacer(),
-            rx.upload(
-                rx.button(
-                    rx.icon(tag="upload", size=14),
-                    "导入",
-                    variant="soft",
-                    color_scheme="blue",
-                    size="1",
-                    title="导入论文",
-                    font_size="calc(var(--base-font) * 0.7)",
-                ),
-                accept={"application/pdf": [".pdf"]},
-                max_files=10,
-                on_drop=LibraryState.upload_papers,
-                border="0",
-                padding="0",
-            ),
             rx.menu.root(
                 rx.menu.trigger(
-                    rx.button(rx.icon(tag="ellipsis", size=15), variant="ghost", color_scheme="gray", size="1", title="更多"),
+                    rx.button(
+                        rx.icon(tag="plus", size=15),
+                        variant="soft",
+                        color_scheme="blue",
+                        size="1",
+                        title="新建或管理论文库",
+                    ),
                 ),
                 rx.menu.content(
                     rx.menu.item(rx.icon(tag="folder_plus", size=14), "新建文件夹", on_click=LibraryState.start_create_folder),

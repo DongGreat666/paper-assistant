@@ -668,7 +668,9 @@ class TranslateState(rx.State):
         # Cached translation
         zh_path = Path(folder_path) / f"{stem}_zh.md"
         if zh_path.exists() and not translated_md:
-            result = zh_path.read_text(encoding="utf-8")
+            result = normalize_escaped_brackets_in_link_labels(
+                zh_path.read_text(encoding="utf-8")
+            )
             html = markdown_to_html(result)
             async with self:
                 self.translated_md = result
@@ -760,6 +762,7 @@ class TranslateState(rx.State):
             result_report = RepairReport()
             result = repair_markdown_code_fences(result)
             result = repair_heading_levels(result, result_report)
+            result = normalize_escaped_brackets_in_link_labels(result)
 
             if _is_cancelled(token) or self.stop_requested:
                 async with self:
